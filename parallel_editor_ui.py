@@ -15,7 +15,24 @@ class ParallelEditorUI:
     def __init__(self):
         self.parallel_editor = ParallelEditingWindowAgent()
     
-    def render_parallel_editor(self, state: TextReaderState, chunk_id: int, api_key: str = None) -> Dict[str, Any]:
+    def _get_base_filename_from_state(self, state: Dict[str, Any]) -> str:
+        """Extract the first uploaded filename without extension for use as base export name"""
+        try:
+            extracted_texts = state.get("extracted_texts", [])
+            if extracted_texts:
+                filename = extracted_texts[0].get("filename", "")
+                if filename:
+                    # Remove extension
+                    import os
+                    base_name = os.path.splitext(filename)[0]
+                    return base_name
+            return None
+        except Exception:
+            return None
+    
+    def render_parallel_editor(self, state: TextReaderState, chunk_id: int, api_key: str = None,
+                             ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None,
+                             summarization_ai: str = None) -> Dict[str, Any]:
         """Render the main parallel editing interface"""
         
         # Initialize session state for this chunk if needed
@@ -30,6 +47,20 @@ class ParallelEditorUI:
         
         editing_session = st.session_state[session_key]
         
+        # Debug: Show what text is actually in the editing session
+        original_length = len(editing_session.get("original_text", ""))
+        parallel_length = len(editing_session.get("parallel_text", ""))
+        st.info(f"🔧 **Editing Session Debug**: Original={original_length:,} chars, Parallel={parallel_length:,} chars")
+        
+        # Show preview of what's actually in the editing session
+        with st.expander("🔍 Editing Session Content", expanded=False):
+            original_text = editing_session.get("original_text", "")
+            st.write(f"**Original Text Start**: {original_text[:200]}...")
+            st.write(f"**Original Text End**: ...{original_text[-200:]}")
+            parallel_text = editing_session.get("parallel_text", "")
+            st.write(f"**Parallel Text Start**: {parallel_text[:200]}...")
+            st.write(f"**Parallel Text End**: ...{parallel_text[-200:]}")
+        
         # Check for pending AI improvement request
         ai_improve_key = f"ai_improve_request_{chunk_id}"
         if ai_improve_key in st.session_state:
@@ -38,14 +69,18 @@ class ParallelEditorUI:
             
             # Use the API key passed from the main app
             
-            if api_key:
-                with st.spinner(f"🤖 Improving text using OpenAI ({improvement_type.title()} style)..."):
+            # Check if AI provider requirements are met
+            if (ai_provider == "OpenAI" and api_key) or (ai_provider == "Ollama" and ollama_url and ollama_model):
+                with st.spinner(f"🤖 Improving text using {ai_provider} ({improvement_type.title()} style)..."):
                     try:
-                        # Improve the text
-                        result = self.parallel_editor.improve_text_with_openai(
+                        # Improve the text with the specified AI provider
+                        result = self.parallel_editor.improve_text_with_ai(
                             editing_session, 
                             api_key, 
-                            improvement_type
+                            improvement_type,
+                            ai_provider,
+                            ollama_url,
+                            ollama_model
                         )
                         
                         if result["success"]:
@@ -59,7 +94,10 @@ class ParallelEditorUI:
                     except Exception as e:
                         st.error(f"❌ Text improvement error: {str(e)}")
             else:
-                st.error("❌ OpenAI API key required for text improvement")
+                if ai_provider == "OpenAI":
+                    st.error("❌ OpenAI API key required for text improvement")
+                elif ai_provider == "Ollama":
+                    st.error("❌ Ollama URL and model required for text improvement")
             
             # Clear the request
             del st.session_state[ai_improve_key]
@@ -131,14 +169,20 @@ class ParallelEditorUI:
                     
                     if not text_to_summarize.strip():
                         st.error("❌ No text to summarize")
-                    elif not api_key:
+                    elif (summarization_ai or ai_provider) == "OpenAI" and not api_key:
                         st.error("❌ OpenAI API key required for text summarization")
+                    elif (summarization_ai or ai_provider) == "Ollama" and (not ollama_url or not ollama_model):
+                        st.error("❌ Ollama URL and model required for text summarization")
                     else:
-                        # Use the parallel editor agent to summarize
-                        result = self.parallel_editor.summarize_text_with_openai(
+                        # Use the parallel editor agent to summarize with selected AI provider
+                        actual_ai_provider = summarization_ai or ai_provider
+                        result = self.parallel_editor.summarize_text_with_ai(
                             editing_session, 
                             api_key, 
-                            target_length=250
+                            target_length=250,
+                            ai_provider=actual_ai_provider,
+                            ollama_url=ollama_url,
+                            ollama_model=ollama_model
                         )
                         
                         if result["success"]:
@@ -207,6 +251,12 @@ class ParallelEditorUI:
                         tts_engine = getattr(st.session_state, 'current_tts_engine', "Google TTS (Free)")
                         tts_settings = getattr(st.session_state, 'current_tts_settings', {})
                         
+                        # Get base filename for export naming
+                        base_filename = self._get_base_filename_from_state(state)
+                        
+                        # Determine actual summarization AI provider
+                        actual_summarization_ai = summarization_ai or ai_provider
+                        
                         # Use the parallel editor agent to generate combined export
                         result = self.parallel_editor.generate_speech_and_summary(
                             editing_session, 
@@ -215,7 +265,11 @@ class ParallelEditorUI:
                             tts_settings=tts_settings,
                             include_speech=include_speech,
                             include_summary=include_summary,
-                            summary_length=summary_length
+                            summary_length=summary_length,
+                            base_filename=base_filename,
+                            summarization_ai=actual_summarization_ai,
+                            ollama_url=ollama_url,
+                            ollama_model=ollama_model
                         )
                         
                         if result["success"]:
@@ -250,10 +304,16 @@ class ParallelEditorUI:
                                 with col2:
                                     st.markdown("### 💾 Download Options")
                                     
+                                    # Generate timestamp for fallback filenames
+                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                    
                                     # HTML download button (always available)
                                     html_content = export_data["html_content"]
-                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                    html_filename = f"text_export_chunk_{chunk_id}_{timestamp}.html"
+                                    base_filename = export_data.get("base_filename")
+                                    if base_filename:
+                                        html_filename = f"{base_filename}.html"
+                                    else:
+                                        html_filename = f"text_export_chunk_{chunk_id}_{timestamp}.html"
                                     
                                     st.download_button(
                                         "📄 Download HTML Export",
@@ -266,11 +326,16 @@ class ParallelEditorUI:
                                     
                                     # Individual download options
                                     if export_data["audio_data"]:
+                                        if base_filename:
+                                            audio_filename = f"{base_filename}.wav"
+                                        else:
+                                            audio_filename = f"speech_chunk_{chunk_id}_{timestamp}.mp3"
+                                        
                                         st.download_button(
                                             "🎵 Download Audio Only",
                                             data=export_data["audio_data"],
-                                            file_name=f"speech_chunk_{chunk_id}_{timestamp}.mp3",
-                                            mime="audio/mp3",
+                                            file_name=audio_filename,
+                                            mime="audio/wav" if base_filename else "audio/mp3",
                                             key=f"download_audio_only_{chunk_id}"
                                         )
                                     
@@ -319,12 +384,21 @@ class ParallelEditorUI:
         
         with col1:
             st.markdown("### 📄 Original Text")
+            
+            # Calculate dynamic height based on text length
+            original_text = editing_session["original_text"]
+            text_length = len(original_text)
+            # Estimate height: ~80 chars per line, ~20 pixels per line, minimum 300px, maximum 800px
+            estimated_lines = max(15, min(40, text_length // 80))
+            dynamic_height = min(800, max(300, estimated_lines * 20))
+            
             st.text_area(
                 "Original",
-                value=editing_session["original_text"],
-                height=300,
+                value=original_text,
+                height=dynamic_height,
                 disabled=True,
-                key=f"original_{chunk_id}"
+                key=f"original_{chunk_id}",
+                help=f"Original text ({text_length:,} characters, {len(original_text.split())} words)"
             )
             
             # Display completion suggestions
@@ -376,12 +450,18 @@ class ParallelEditorUI:
             refresh_key = editing_session.get("last_ai_improvement", {}).get("applied_at", "")
             text_area_key = f"parallel_{chunk_id}_{hash(refresh_key) if refresh_key else ''}"
             
+            # Use same dynamic height as original text
+            parallel_text = editing_session["parallel_text"]
+            parallel_length = len(parallel_text)
+            parallel_lines = max(15, min(40, parallel_length // 80))
+            parallel_height = min(800, max(300, parallel_lines * 20))
+            
             edited_text = st.text_area(
                 "Edit your text here",
-                value=editing_session["parallel_text"],
-                height=300,
+                value=parallel_text,
+                height=parallel_height,
                 key=text_area_key,
-                help="Make your edits here or use AI improvement above. Changes will be highlighted when you approve."
+                help=f"Make your edits here or use AI improvement above. ({parallel_length:,} characters, {len(parallel_text.split())} words)"
             )
             
             # Update parallel text if changed
@@ -698,7 +778,9 @@ class ParallelEditorUI:
         else:
             st.error(f"❌ Speech generation failed: {audio_result['error']}")
     
-    def render_full_workflow_interface(self, state: TextReaderState, chunk_id: int, api_key: str = None):
+    def render_full_workflow_interface(self, state: TextReaderState, chunk_id: int, api_key: str = None, 
+                                     ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None,
+                                     summarization_ai: str = None):
         """Render the complete workflow interface for grammar checking and editing"""
         
         st.markdown("---")
@@ -724,7 +806,7 @@ class ParallelEditorUI:
             st.caption("Generate audio")
         
         # Main workflow
-        workflow_action = self.render_parallel_editor(state, chunk_id, api_key)
+        workflow_action = self.render_parallel_editor(state, chunk_id, api_key, ai_provider, ollama_url, ollama_model, summarization_ai)
         
         if workflow_action["action"] == "approve":
             # Handle approval

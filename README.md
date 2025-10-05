@@ -23,8 +23,10 @@ A sophisticated multi-agent text processing system built with Streamlit and Lang
 - **Human-in-the-Loop**: Review and approve AI suggestions before applying changes
 
 ### 🎵 **Interactive Text-to-Speech**
-- **Dual TTS Engines**: Google TTS (free) and OpenAI TTS (premium) with voice options
-- **Synchronized Highlighting**: Real-time text highlighting during audio playback
+- **Multiple TTS Engines**: Google TTS (free), OpenAI TTS (premium), Mozilla TTS (local), and Coqui TTS (advanced local)
+- **Voice Cloning**: Coqui TTS XTTS v2 supports custom voice cloning from audio samples
+- **Multilingual Support**: Coqui TTS supports 14+ languages with natural-sounding voices
+- **Synchronized Highlighting**: Real-time text highlighting during audio playbook
 - **Interactive HTML Export**: Standalone files with embedded audio and click-to-navigate
 - **Custom Audio Controls**: Play/pause, skip, restart, progress bar, keyboard shortcuts
 
@@ -112,15 +114,17 @@ streamlit run grammar_checker_demo.py
 - **Frontend**: Streamlit with custom UI components
 - **AI/ML**: OpenAI GPT-3.5 Turbo, LangGraph workflow engine
 - **OCR**: Tesseract OCR, EasyOCR
-- **TTS**: Google Text-to-Speech (gTTS), OpenAI TTS
+- **TTS**: Google Text-to-Speech (gTTS), OpenAI TTS, Mozilla TTS, Coqui TTS
 - **Audio Processing**: PyAudio, base64 encoding for web embedding
 - **Document Processing**: PyPDF2, Pillow for image handling
 
 ## 🎛️ Configuration Options
 
 ### TTS Engines
-- **Google TTS**: Free, 10+ languages, good quality
-- **OpenAI TTS**: Premium, multiple voice options (alloy, echo, fable, onyx, nova, shimmer)
+- **Google TTS**: Free, 10+ languages, good quality, requires internet
+- **OpenAI TTS**: Premium, multiple voice options (alloy, echo, fable, onyx, nova, shimmer), requires API key
+- **Mozilla TTS**: Local, high-quality neural voices, works offline, requires model download (~1-2GB)
+- **Coqui TTS**: Advanced local TTS with voice cloning, XTTS v2 multilingual support, custom speakers
 
 ### OCR Engines
 - **Tesseract**: Fast, lightweight, good for clean text
@@ -165,6 +169,14 @@ robin-reader/
 - **Progress Tracking**: Visual progress bar with time display
 - **Responsive Design**: Works on desktop and mobile devices
 
+### Coqui TTS Advanced Features
+- **XTTS v2 Voice Cloning**: Clone any voice from a 3-10 second audio sample
+- **Built-in Speaker Library**: 12+ high-quality pre-trained speaker voices
+- **Multilingual Generation**: Support for English, Spanish, French, German, Italian, Portuguese, Polish, Turkish, Russian, Dutch, Czech, Arabic, Chinese, and Japanese
+- **Real-time Processing**: Fast neural voice synthesis with GPU acceleration (when available)
+- **Custom Model Support**: Load and use custom-trained TTS models
+- **Offline Operation**: Complete privacy with local processing, no internet required
+
 ## 🐛 Troubleshooting
 
 ### Common Issues
@@ -178,6 +190,17 @@ robin-reader/
 - Verify browser audio permissions
 - Test with different browsers
 - Check OpenAI API key for premium TTS
+- For voice cloning: Use clear, 3-10 second audio samples in WAV/MP3 format
+
+**TTS Installation Issues (Coqui/Mozilla TTS):**
+- **Python Version**: Requires Python 3.8-3.11 (not 3.12+)
+- **Method 1**: `pip install TTS --upgrade`
+- **Method 2**: `pip install git+https://github.com/coqui-ai/TTS.git`
+- **Method 3**: `pip install TTS[all] --upgrade`
+- **Method 4**: `conda install -c conda-forge tts`
+- **Windows**: Install Microsoft C++ Build Tools first
+- **Linux**: `sudo apt-get install espeak espeak-data libespeak1 libespeak-dev build-essential`
+- **macOS**: Install Xcode command line tools: `xcode-select --install`
 
 **Session Issues:**
 - Use "Clear All Work" button to reset corrupted sessions

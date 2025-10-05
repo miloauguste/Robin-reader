@@ -6,6 +6,7 @@ Specialized agents for file processing, text extraction, grammar/spell checking,
 import os
 import io
 import json
+import requests
 from typing import Dict, List, Any, Optional, TypedDict
 from datetime import datetime, date
 from langgraph.graph import StateGraph, END
@@ -128,6 +129,59 @@ class OpenAIRateLimiter:
 
 # Global rate limiter instance
 rate_limiter = OpenAIRateLimiter(daily_limit=20000)
+
+# Ollama client class for local LLM integration
+class OllamaClient:
+    """Client for interacting with Ollama local LLM server"""
+    
+    def __init__(self, base_url: str = "http://localhost:11434"):
+        self.base_url = base_url.rstrip('/')
+        self.api_url = f"{self.base_url}/api"
+    
+    def is_available(self) -> bool:
+        """Check if Ollama server is available"""
+        try:
+            response = requests.get(f"{self.api_url}/tags", timeout=5)
+            return response.status_code == 200
+        except Exception:
+            return False
+    
+    def get_models(self) -> List[str]:
+        """Get list of available models"""
+        try:
+            response = requests.get(f"{self.api_url}/tags", timeout=5)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                return [m['name'] for m in models]
+        except Exception:
+            pass
+        return []
+    
+    def generate(self, model: str, prompt: str, system_prompt: str = None, timeout: int = 60, **kwargs) -> str:
+        """Generate text using Ollama model"""
+        try:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                **kwargs
+            }
+            
+            response = requests.post(f"{self.api_url}/chat", json=payload, timeout=timeout)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('message', {}).get('content', '').strip()
+            else:
+                raise Exception(f"Ollama request failed: {response.status_code} - {response.text}")
+        
+        except Exception as e:
+            raise Exception(f"Ollama generation error: {str(e)}")
 
 # State definition for the workflow
 class TextReaderState(TypedDict):
@@ -269,6 +323,9 @@ class TextExtractionAgent:
     
     def __call__(self, state: TextReaderState) -> TextReaderState:
         """Extract text from all uploaded files in specified order"""
+        import streamlit as st
+        import time
+        
         try:
             uploaded_files = state.get("uploaded_files", [])
             file_order = state.get("file_order", [])
@@ -285,38 +342,115 @@ class TextExtractionAgent:
             existing_filenames = {item["filename"] for item in existing_extracted_texts}
             new_extractions = []
             
-            for i, file_idx in enumerate(file_order):
-                if file_idx >= len(uploaded_files):
-                    continue
-                    
-                uploaded_file = uploaded_files[file_idx]
+            # Calculate files to process (skip already processed)
+            files_to_process = [
+                (position_index, file_idx) for position_index, file_idx in enumerate(file_order)
+                if file_idx < len(uploaded_files) and uploaded_files[file_idx].name not in existing_filenames
+            ]
+            
+            print(f"DEBUG: Starting file extraction")
+            print(f"DEBUG: uploaded_files count: {len(uploaded_files)}")
+            print(f"DEBUG: files to process: {len(files_to_process)}")
+            print(f"DEBUG: existing_filenames: {existing_filenames}")
+            
+            # Create progress bar and time estimation
+            if files_to_process:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                time_text = st.empty()
+                start_time = time.time()
                 
-                # Skip if this file was already processed (avoid duplicates)
-                if uploaded_file.name in existing_filenames:
-                    continue
-                    
+                # Time estimates per file type (seconds)
+                time_estimates = {
+                    "application/pdf": 5,  # 5 seconds per PDF page
+                    "image/jpeg": 15,      # 15 seconds per image (OCR)
+                    "image/png": 15,
+                    "image/gif": 15,
+                    "default": 10
+                }
+            
+            for i, (position_index, file_idx) in enumerate(files_to_process):
+                # Update progress
+                progress = (i + 1) / len(files_to_process)
+                progress_bar.progress(progress)
+                
+                uploaded_file = uploaded_files[file_idx]
                 file_type = uploaded_file.type
                 
-                # Extract text based on file type
-                if file_type == "application/pdf":
-                    text = self.extract_text_from_pdf(uploaded_file)
-                elif file_type.startswith("image/"):
-                    if ocr_engine == "EasyOCR":
-                        text = self.extract_text_from_image_easyocr(uploaded_file)
-                    else:
-                        text = self.extract_text_from_image_tesseract(uploaded_file)
-                else:
-                    text = "[Unsupported file type]"
+                # Estimate time for this file
+                estimated_time = time_estimates.get(file_type, time_estimates["default"])
                 
-                new_extractions.append({
-                    "page": max_existing_page + len(new_extractions) + 1,
-                    "text": text,
-                    "filename": uploaded_file.name,
-                    "file_type": file_type
-                })
+                # Update status
+                status_text.text(f"📄 Processing file {i + 1} of {len(files_to_process)}: {uploaded_file.name}")
+                
+                # Calculate time estimates
+                elapsed_time = time.time() - start_time
+                if i > 0:
+                    avg_time_per_file = elapsed_time / i
+                    remaining_files = len(files_to_process) - i
+                    estimated_remaining = remaining_files * avg_time_per_file
+                    time_text.text(f"⏱️ Elapsed: {elapsed_time:.1f}s | Estimated remaining: {estimated_remaining:.1f}s")
+                else:
+                    time_text.text(f"⏱️ Starting extraction... Estimated: {estimated_time}s per file")
+                
+                print(f"Processing file {i + 1}/{len(files_to_process)}: {uploaded_file.name} (type: {file_type})")
+                
+                # Extract text based on file type
+                file_start_time = time.time()
+                
+                try:
+                    if file_type == "application/pdf":
+                        text = self.extract_text_from_pdf(uploaded_file)
+                    elif file_type.startswith("image/"):
+                        if ocr_engine == "EasyOCR":
+                            text = self.extract_text_from_image_easyocr(uploaded_file)
+                        else:
+                            text = self.extract_text_from_image_tesseract(uploaded_file)
+                    else:
+                        text = "[Unsupported file type]"
+                    
+                    print(f"Extracted {len(text)} characters from {uploaded_file.name}")
+                    
+                    new_extraction = {
+                        "page": max_existing_page + len(new_extractions) + 1,
+                        "text": text,
+                        "filename": uploaded_file.name,
+                        "file_type": file_type
+                    }
+                    
+                    new_extractions.append(new_extraction)
+                    print(f"DEBUG: Added extraction for {uploaded_file.name}, total new extractions: {len(new_extractions)}")
+                    
+                except Exception as e:
+                    import traceback
+                    error_details = traceback.format_exc()
+                    print(f"ERROR: Failed to extract from {uploaded_file.name}: {str(e)}")
+                    print(f"ERROR: Full traceback:\n{error_details}")
+                    # Add failed extraction to list to track it
+                    new_extractions.append({
+                        "page": max_existing_page + len(new_extractions) + 1,
+                        "text": f"[ERROR: Failed to extract text from {uploaded_file.name}: {str(e)}]",
+                        "filename": uploaded_file.name,
+                        "file_type": file_type,
+                        "extraction_error": True
+                    })
+                    print(f"DEBUG: Added error placeholder for {uploaded_file.name}, total new extractions: {len(new_extractions)}")
+                    # Continue with next file instead of stopping
+            
+            # Complete progress tracking
+            if files_to_process:
+                progress_bar.progress(1.0)
+                total_time = time.time() - start_time
+                status_text.text(f"✅ Completed processing {len(files_to_process)} files!")
+                time_text.text(f"⏱️ Total time: {total_time:.1f}s | Average: {total_time/len(files_to_process):.1f}s per file")
             
             # Add new extractions to the list
             extracted_texts.extend(new_extractions)
+            
+            print(f"DEBUG: Final extraction summary:")
+            print(f"DEBUG: - new_extractions count: {len(new_extractions)}")
+            print(f"DEBUG: - total extracted_texts count: {len(extracted_texts)}")
+            print(f"DEBUG: - filenames processed: {[ext['filename'] for ext in new_extractions]}")
             
             # If no new files were processed and no existing files, return error
             if not extracted_texts:
@@ -473,20 +607,23 @@ class GrammarAnalysisAgent:
         # Very long sentences with multiple commas might be run-ons
         return len(words) > 30 and comma_count > 3
     
-    def complete_sentence_with_llm(self, incomplete_sentence: str, context: str, api_key: str) -> str:
+    def complete_sentence_with_llm(self, incomplete_sentence: str, context: str, api_key: str = None, 
+                                   ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> str:
         """Use LLM to complete or fix incomplete sentences"""
         try:
-            # Combine text for rate limit check
+            # Combine text for rate limit check (only for OpenAI)
             combined_text = f"{context} {incomplete_sentence}"
             
-            if not rate_limiter.can_make_request(1, combined_text):
-                usage_info = rate_limiter.get_usage_info()
-                if usage_info["usage_percentage"] >= 100:
-                    raise Exception(f"Daily API limit exceeded. Remaining requests: {usage_info['requests_remaining']}/{rate_limiter.daily_limit}")
-                else:
-                    raise Exception(f"Per-minute token limit would be exceeded. Current minute usage: {usage_info['tokens_current_minute']}/{rate_limiter.tokens_per_minute} tokens")
-            
-            client = OpenAI(api_key=api_key)
+            if ai_provider == "OpenAI":
+                if not api_key:
+                    raise Exception("OpenAI API key is required for OpenAI provider")
+                
+                if not rate_limiter.can_make_request(1, combined_text):
+                    usage_info = rate_limiter.get_usage_info()
+                    if usage_info["usage_percentage"] >= 100:
+                        raise Exception(f"Daily API limit exceeded. Remaining requests: {usage_info['requests_remaining']}/{rate_limiter.daily_limit}")
+                    else:
+                        raise Exception(f"Per-minute token limit would be exceeded. Current minute usage: {usage_info['tokens_current_minute']}/{rate_limiter.tokens_per_minute} tokens")
             
             # Create a detailed prompt for sentence completion
             system_prompt = """You are a grammar expert specializing in sentence completion and repair. Your task is to:
@@ -505,18 +642,41 @@ Incomplete sentence to fix: "{incomplete_sentence}"
 
 Please complete or repair this sentence to make it grammatically correct and complete while preserving its original meaning."""
             
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=500,
-                temperature=0.3
-            )
+            # Use appropriate AI provider
+            if ai_provider == "OpenAI":
+                client = OpenAI(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    max_tokens=500,
+                    temperature=0.3
+                )
+                rate_limiter.record_request(1, combined_text)
+                return response.choices[0].message.content.strip()
+                
+            elif ai_provider == "Ollama":
+                if not ollama_url or not ollama_model:
+                    raise Exception("Ollama URL and model are required for Ollama provider")
+                
+                ollama_client = OllamaClient(ollama_url)
+                if not ollama_client.is_available():
+                    raise Exception(f"Ollama server not available at {ollama_url}")
+                
+                result = ollama_client.generate(
+                    model=ollama_model,
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    timeout=90,  # 1.5 minutes timeout for spell checking
+                    temperature=0.3,
+                    max_tokens=500
+                )
+                return result
             
-            rate_limiter.record_request(1, combined_text)
-            return response.choices[0].message.content.strip()
+            else:
+                raise Exception(f"Unsupported AI provider: {ai_provider}")
             
         except Exception as e:
             raise Exception(f"LLM sentence completion error: {str(e)}")
@@ -630,33 +790,66 @@ class TextProcessingAgent:
         
         return chunks
     
-    def spell_check_openai(self, text: str, api_key: str) -> str:
-        """Check and correct spelling using OpenAI GPT with rate limiting"""
+    def spell_check_with_ai(self, text: str, api_key: str = None, ai_provider: str = "OpenAI", 
+                          ollama_url: str = None, ollama_model: str = None) -> str:
+        """Check and correct spelling using AI (OpenAI or Ollama) with rate limiting"""
         try:
-            # Check rate limit before making request (both daily and per-minute)
-            if not rate_limiter.can_make_request(1, text):
-                usage_info = rate_limiter.get_usage_info()
-                if usage_info["usage_percentage"] >= 100:
-                    raise Exception(f"Daily API limit exceeded. Remaining requests: {usage_info['requests_remaining']}/{rate_limiter.daily_limit}")
-                else:
-                    raise Exception(f"Per-minute token limit would be exceeded. Current minute usage: {usage_info['tokens_current_minute']}/{rate_limiter.tokens_per_minute} tokens")
+            # Check rate limit for OpenAI only
+            if ai_provider == "OpenAI":
+                if not api_key:
+                    raise Exception("OpenAI API key is required for OpenAI provider")
+                    
+                if not rate_limiter.can_make_request(1, text):
+                    usage_info = rate_limiter.get_usage_info()
+                    if usage_info["usage_percentage"] >= 100:
+                        raise Exception(f"Daily API limit exceeded. Remaining requests: {usage_info['requests_remaining']}/{rate_limiter.daily_limit}")
+                    else:
+                        raise Exception(f"Per-minute token limit would be exceeded. Current minute usage: {usage_info['tokens_current_minute']}/{rate_limiter.tokens_per_minute} tokens")
             
-            client = OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a spelling assistant. Correct only spelling errors while preserving the original meaning, tone, and grammar structure. Return only the corrected text without explanations."},
-                    {"role": "user", "content": f"Please correct only the spelling errors in this text:\n\n{text}"}
-                ],
-                max_tokens=4000,
-                temperature=0.1
-            )
+            system_prompt = "You are a spelling assistant. Correct only spelling errors while preserving the original meaning, tone, and grammar structure. Return only the corrected text without explanations."
+            user_prompt = f"Please correct only the spelling errors in this text:\n\n{text}"
             
-            # Record the successful request with text for token tracking
-            rate_limiter.record_request(1, text)
-            return response.choices[0].message.content.strip()
+            # Use appropriate AI provider
+            if ai_provider == "OpenAI":
+                client = OpenAI(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    max_tokens=4000,
+                    temperature=0.1
+                )
+                rate_limiter.record_request(1, text)
+                return response.choices[0].message.content.strip()
+                
+            elif ai_provider == "Ollama":
+                if not ollama_url or not ollama_model:
+                    raise Exception("Ollama URL and model are required for Ollama provider")
+                
+                ollama_client = OllamaClient(ollama_url)
+                if not ollama_client.is_available():
+                    raise Exception(f"Ollama server not available at {ollama_url}")
+                
+                result = ollama_client.generate(
+                    model=ollama_model,
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    timeout=90,  # 1.5 minutes timeout for spell checking  
+                    temperature=0.1
+                )
+                return result
+            
+            else:
+                raise Exception(f"Unsupported AI provider: {ai_provider}")
         except Exception as e:
             raise Exception(f"Spell check error: {str(e)}")
+    
+    # Backward compatibility method
+    def spell_check_openai(self, text: str, api_key: str) -> str:
+        """Backward compatibility wrapper for OpenAI spell check"""
+        return self.spell_check_with_ai(text, api_key, "OpenAI")
     
     def grammar_check_openai(self, text: str, api_key: str) -> str:
         """Check and correct grammar using OpenAI GPT with rate limiting"""
@@ -686,16 +879,21 @@ class TextProcessingAgent:
         except Exception as e:
             raise Exception(f"Grammar check error: {str(e)}")
     
-    def improve_text_openai(self, text: str, api_key: str, improvement_type: str = "general") -> str:
-        """Improve text using OpenAI GPT with specific improvement types"""
+    def improve_text_with_ai(self, text: str, api_key: str = None, improvement_type: str = "general", 
+                           ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> str:
+        """Improve text using AI (OpenAI or Ollama) with specific improvement types"""
         try:
-            # Check rate limit before making request (both daily and per-minute)
-            if not rate_limiter.can_make_request(1, text):
-                usage_info = rate_limiter.get_usage_info()
-                if usage_info["usage_percentage"] >= 100:
-                    raise Exception(f"Daily API limit exceeded. Remaining requests: {usage_info['requests_remaining']}/{rate_limiter.daily_limit}")
-                else:
-                    raise Exception(f"Per-minute token limit would be exceeded. Current minute usage: {usage_info['tokens_current_minute']}/{rate_limiter.tokens_per_minute} tokens")
+            # Check rate limit for OpenAI only
+            if ai_provider == "OpenAI":
+                if not api_key:
+                    raise Exception("OpenAI API key is required for OpenAI provider")
+                    
+                if not rate_limiter.can_make_request(1, text):
+                    usage_info = rate_limiter.get_usage_info()
+                    if usage_info["usage_percentage"] >= 100:
+                        raise Exception(f"Daily API limit exceeded. Remaining requests: {usage_info['requests_remaining']}/{rate_limiter.daily_limit}")
+                    else:
+                        raise Exception(f"Per-minute token limit would be exceeded. Current minute usage: {usage_info['tokens_current_minute']}/{rate_limiter.tokens_per_minute} tokens")
             
             # Define improvement prompts
             improvement_prompts = {
@@ -709,35 +907,58 @@ class TextProcessingAgent:
             
             system_prompt = improvement_prompts.get(improvement_type, improvement_prompts["general"])
             
-            client = OpenAI(api_key=api_key)
+            # Use appropriate AI provider
+            if ai_provider == "OpenAI":
+                client = OpenAI(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": system_prompt + " Return only the improved text without explanations or additional commentary."},
+                        {"role": "user", "content": text}
+                    ],
+                    max_tokens=4000,
+                    temperature=0.4
+                )
+                rate_limiter.record_request(1, text)
+                return response.choices[0].message.content.strip()
+                
+            elif ai_provider == "Ollama":
+                if not ollama_url or not ollama_model:
+                    raise Exception("Ollama URL and model are required for Ollama provider")
+                
+                ollama_client = OllamaClient(ollama_url)
+                if not ollama_client.is_available():
+                    raise Exception(f"Ollama server not available at {ollama_url}")
+                
+                result = ollama_client.generate(
+                    model=ollama_model,
+                    prompt=text,
+                    system_prompt=system_prompt + " Return only the improved text without explanations or additional commentary.",
+                    timeout=120,  # 2 minutes timeout for text improvement
+                    temperature=0.4
+                )
+                return result
             
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt + " Return only the improved text without explanations or additional commentary."},
-                    {"role": "user", "content": text}
-                ],
-                max_tokens=4000,
-                temperature=0.4
-            )
-            
-            # Record the successful request
-            rate_limiter.record_request(1, text)
-            
-            return response.choices[0].message.content.strip()
+            else:
+                raise Exception(f"Unsupported AI provider: {ai_provider}")
         except Exception as e:
             raise Exception(f"Text improvement error: {str(e)}")
     
-    def summarize_text_openai(self, text: str, api_key: str, target_length: int = 250) -> str:
-        """Summarize text using OpenAI with specific line references and target word count"""
+    def summarize_text_with_ai(self, text: str, api_key: str = None, target_length: int = 250,
+                             ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> str:
+        """Summarize text using AI (OpenAI or Ollama) with specific line references and target word count"""
         try:
-            # Check rate limit before making request
-            if not rate_limiter.can_make_request(1, text):
-                usage_info = rate_limiter.get_usage_info()
-                if usage_info["usage_percentage"] >= 100:
-                    raise Exception(f"Daily API limit exceeded. Remaining requests: {usage_info['requests_remaining']}/{rate_limiter.daily_limit}")
-                else:
-                    raise Exception(f"Per-minute token limit would be exceeded. Current minute usage: {usage_info['tokens_current_minute']}/{rate_limiter.tokens_per_minute} tokens")
+            # Check rate limit for OpenAI only
+            if ai_provider == "OpenAI":
+                if not api_key:
+                    raise Exception("OpenAI API key is required for OpenAI provider")
+                    
+                if not rate_limiter.can_make_request(1, text):
+                    usage_info = rate_limiter.get_usage_info()
+                    if usage_info["usage_percentage"] >= 100:
+                        raise Exception(f"Daily API limit exceeded. Remaining requests: {usage_info['requests_remaining']}/{rate_limiter.daily_limit}")
+                    else:
+                        raise Exception(f"Per-minute token limit would be exceeded. Current minute usage: {usage_info['tokens_current_minute']}/{rate_limiter.tokens_per_minute} tokens")
             
             # Add line numbers to the text for reference
             lines = text.split('\n')
@@ -759,24 +980,53 @@ class TextProcessingAgent:
 
 Format your summary as flowing paragraphs with embedded line references. Make it comprehensive and detailed while remaining readable."""
             
-            client = OpenAI(api_key=api_key)
+            user_prompt = f"Please create a detailed summary of the following text with line references:\n\n{numbered_text}"
             
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Please create a detailed summary of the following text with line references:\n\n{numbered_text}"}
-                ],
-                max_tokens=4000,
-                temperature=0.3
-            )
+            # Use appropriate AI provider
+            if ai_provider == "OpenAI":
+                client = OpenAI(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    max_tokens=4000,
+                    temperature=0.3
+                )
+                rate_limiter.record_request(1, text)
+                return response.choices[0].message.content.strip()
+                
+            elif ai_provider == "Ollama":
+                if not ollama_url or not ollama_model:
+                    raise Exception("Ollama URL and model are required for Ollama provider")
+                
+                ollama_client = OllamaClient(ollama_url)
+                if not ollama_client.is_available():
+                    raise Exception(f"Ollama server not available at {ollama_url}")
+                
+                result = ollama_client.generate(
+                    model=ollama_model,
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    timeout=180,  # 3 minutes timeout for summarization
+                    temperature=0.3
+                )
+                return result
             
-            # Record the successful request
-            rate_limiter.record_request(1, text)
-            
-            return response.choices[0].message.content.strip()
+            else:
+                raise Exception(f"Unsupported AI provider: {ai_provider}")
         except Exception as e:
             raise Exception(f"Text summarization error: {str(e)}")
+    
+    # Backward compatibility methods
+    def improve_text_openai(self, text: str, api_key: str, improvement_type: str = "general") -> str:
+        """Backward compatibility wrapper for OpenAI text improvement"""
+        return self.improve_text_with_ai(text, api_key, improvement_type, "OpenAI")
+    
+    def summarize_text_openai(self, text: str, api_key: str, target_length: int = 250) -> str:
+        """Backward compatibility wrapper for OpenAI text summarization"""
+        return self.summarize_text_with_ai(text, api_key, target_length, "OpenAI")
     
     def __call__(self, state: TextReaderState) -> TextReaderState:
         """Process extracted texts into chunks and optionally perform spell/grammar checking"""
@@ -864,12 +1114,19 @@ Format your summary as flowing paragraphs with embedded line references. Make it
                 "current_step": "error"
             }
     
-    def process_chunk_spell_check(self, state: TextReaderState, chunk_id: int) -> TextReaderState:
-        """Perform spell check on a specific chunk"""
+    def process_chunk_spell_check(self, state: TextReaderState, chunk_id: int, api_key: str = None,
+                                ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> TextReaderState:
+        """Perform spell check on a specific chunk using specified AI provider"""
         try:
-            api_key = state.get("api_key")
+            # Use provided api_key or fall back to state api_key
             if not api_key:
-                raise Exception("OpenAI API key required for spell check")
+                api_key = state.get("api_key")
+            
+            # Check provider requirements
+            if ai_provider == "OpenAI" and not api_key:
+                raise Exception("OpenAI API key required for spell check with OpenAI")
+            elif ai_provider == "Ollama" and (not ollama_url or not ollama_model):
+                raise Exception("Ollama URL and model required for spell check with Ollama")
             
             processed_chunks = state.get("processed_chunks", [])
             if chunk_id >= len(processed_chunks):
@@ -878,7 +1135,7 @@ Format your summary as flowing paragraphs with embedded line references. Make it
             chunk = processed_chunks[chunk_id]
             original_text = chunk["current_text"]
             
-            corrected_text = self.spell_check_openai(original_text, api_key)
+            corrected_text = self.spell_check_with_ai(original_text, api_key, ai_provider, ollama_url, ollama_model)
             
             # Update the chunk
             processed_chunks[chunk_id]["current_text"] = corrected_text
@@ -1223,6 +1480,48 @@ class ParallelEditingWindowAgent:
                 "error": f"Text improvement failed: {str(e)}"
             }
     
+    def improve_text_with_ai(self, editing_session: Dict[str, Any], api_key: str = None, improvement_type: str = "general",
+                           ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> Dict[str, Any]:
+        """Improve text using AI (OpenAI or Ollama) with specified improvement type"""
+        try:
+            current_text = editing_session["parallel_text"]
+            text_processor = TextProcessingAgent()
+            
+            # Use the new improve_text_with_ai method from TextProcessingAgent
+            improved_text = text_processor.improve_text_with_ai(
+                current_text, api_key, improvement_type, ai_provider, ollama_url, ollama_model
+            )
+            
+            # Update the editing session
+            editing_session["parallel_text"] = improved_text
+            editing_session["changes_made"] = True
+            editing_session["last_ai_improvement"] = {
+                "improvement_type": improvement_type,
+                "original_text": current_text,
+                "improved_text": improved_text,
+                "applied_at": datetime.now().isoformat(),
+                "ai_provider": ai_provider
+            }
+            
+            return {
+                "success": True,
+                "updated_session": editing_session,
+                "improved_text": improved_text,
+                "improvement_type": improvement_type,
+                "ai_provider": ai_provider,
+                "error": None
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "updated_session": editing_session,
+                "improved_text": None,
+                "improvement_type": improvement_type,
+                "ai_provider": ai_provider,
+                "error": f"Text improvement failed: {str(e)}"
+            }
+    
     def summarize_text_with_openai(self, editing_session: Dict[str, Any], api_key: str, target_length: int = 250) -> Dict[str, Any]:
         """Summarize text using OpenAI with specific line references"""
         try:
@@ -1260,10 +1559,52 @@ class ParallelEditingWindowAgent:
                 "error": f"Text summarization failed: {str(e)}"
             }
     
+    def summarize_text_with_ai(self, editing_session: Dict[str, Any], api_key: str = None, target_length: int = 250,
+                             ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> Dict[str, Any]:
+        """Summarize text using AI (OpenAI or Ollama) with specific line references"""
+        try:
+            current_text = editing_session["parallel_text"]
+            text_processor = TextProcessingAgent()
+            
+            # Use the new summarize_text_with_ai method from TextProcessingAgent
+            summary_text = text_processor.summarize_text_with_ai(
+                current_text, api_key, target_length, ai_provider, ollama_url, ollama_model
+            )
+            
+            # Store the summary in the editing session
+            editing_session["last_summary"] = {
+                "summary_text": summary_text,
+                "target_length": target_length,
+                "source_text": current_text,
+                "generated_at": datetime.now().isoformat(),
+                "ai_provider": ai_provider
+            }
+            
+            return {
+                "success": True,
+                "updated_session": editing_session,
+                "summary_text": summary_text,
+                "target_length": target_length,
+                "ai_provider": ai_provider,
+                "error": None
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "updated_session": editing_session,
+                "summary_text": None,
+                "target_length": target_length,
+                "ai_provider": ai_provider,
+                "error": f"Text summarization failed: {str(e)}"
+            }
+    
     def generate_speech_and_summary(self, editing_session: Dict[str, Any], api_key: str, 
                                    tts_engine: str = "Google TTS", tts_settings: Dict[str, Any] = None,
                                    include_speech: bool = True, include_summary: bool = True,
-                                   summary_length: int = 250) -> Dict[str, Any]:
+                                   summary_length: int = 250, base_filename: str = None,
+                                   summarization_ai: str = "OpenAI", ollama_url: str = None, 
+                                   ollama_model: str = None) -> Dict[str, Any]:
         """Generate speech and/or summary content and create HTML export"""
         try:
             if not include_speech and not include_summary:
@@ -1324,15 +1665,29 @@ class ParallelEditingWindowAgent:
             
             # Generate summary if requested
             if include_summary:
-                if not api_key:
-                    raise Exception("OpenAI API key required for text summarization")
+                # Check AI provider requirements
+                if summarization_ai == "OpenAI" and not api_key:
+                    raise Exception("OpenAI API key required for text summarization with OpenAI")
+                elif summarization_ai == "Ollama" and (not ollama_url or not ollama_model):
+                    raise Exception("Ollama URL and model required for text summarization with Ollama")
                 
                 text_processor = TextProcessingAgent()
-                summary_text = text_processor.summarize_text_openai(current_text, api_key, summary_length)
+                summary_text = text_processor.summarize_text_with_ai(
+                    current_text, api_key, summary_length, summarization_ai, ollama_url, ollama_model
+                )
                 result_data["summary_text"] = summary_text
+                
+                # Store AI model information for HTML export
+                if summarization_ai == "OpenAI":
+                    result_data["summary_model"] = "OpenAI GPT-3.5 Turbo"
+                elif summarization_ai == "Ollama":
+                    result_data["summary_model"] = f"Ollama {ollama_model}"
+                else:
+                    result_data["summary_model"] = summarization_ai
             
             # Generate HTML content
-            result_data["html_content"] = self._create_html_export(result_data, editing_session)
+            result_data["html_content"] = self._create_html_export(result_data, editing_session, base_filename)
+            result_data["base_filename"] = base_filename  # Store for UI to use in download names
             
             # Update editing session with the combined results
             editing_session["last_combined_export"] = result_data
@@ -1352,7 +1707,7 @@ class ParallelEditingWindowAgent:
                 "error": f"Combined generation failed: {str(e)}"
             }
     
-    def _create_html_export(self, result_data: Dict[str, Any], editing_session: Dict[str, Any]) -> str:
+    def _create_html_export(self, result_data: Dict[str, Any], editing_session: Dict[str, Any], base_filename: str = None) -> str:
         """Create HTML content for export with embedded audio, summary, and synchronized text highlighting"""
         import base64
         import re
@@ -1368,12 +1723,13 @@ class ParallelEditingWindowAgent:
         synchronized_text_html = self._create_synchronized_text(text_content) if audio_data else text_content
         
         # Create HTML structure with synchronized highlighting
+        title = base_filename if base_filename else f"Text Processing Export - {generated_at}"
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Text Processing Export - {generated_at}</title>
+    <title>{title}</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -1589,11 +1945,16 @@ class ParallelEditingWindowAgent:
         # Add summary section if available
         if summary_text:
             summary_word_count = len(summary_text.split())
+            formatted_summary = summary_text.replace('\n', '<br>')
+            summary_model = result_data.get("summary_model", "Unknown AI Model")
             html_content += f"""
         <div class="section">
             <h2 class="section-title">📋 AI-Generated Summary ({summary_word_count} words)</h2>
+            <div class="model-attribution">
+                <small style="color: #666; font-style: italic;">Generated by: {summary_model}</small>
+            </div>
             <div class="summary-text">
-                {summary_text.replace('\n', '<br>')}
+                {formatted_summary}
             </div>
         </div>"""
         
@@ -2150,6 +2511,138 @@ class TextToSpeechAgent:
         except Exception as e:
             raise Exception(f"Google TTS error: {str(e)}")
     
+    def text_to_speech_mozilla(self, text: str, model: str = "tts_models/en/ljspeech/tacotron2-DDC", 
+                             vocoder: str = "vocoder_models/en/ljspeech/hifigan_v2") -> io.BytesIO:
+        """Convert text to speech using Mozilla TTS"""
+        try:
+            # Import Mozilla TTS
+            from TTS.api import TTS
+            import tempfile
+            import os
+            
+            # Initialize TTS with model and vocoder
+            tts = TTS(model_name=model, vocoder_name=vocoder)
+            
+            # Create a temporary file for output
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = temp_file.name
+            
+            # Generate speech
+            tts.tts_to_file(text=text, file_path=temp_path)
+            
+            # Read the generated audio file into BytesIO
+            fp = io.BytesIO()
+            with open(temp_path, 'rb') as audio_file:
+                fp.write(audio_file.read())
+            
+            # Clean up temporary file
+            os.unlink(temp_path)
+            
+            fp.seek(0)
+            return fp
+            
+        except ImportError as e:
+            error_msg = "Mozilla/Coqui TTS not installed. Try these solutions:\n"
+            error_msg += "1. pip install TTS --upgrade\n"
+            error_msg += "2. pip install git+https://github.com/coqui-ai/TTS.git\n"
+            error_msg += "3. conda install -c conda-forge tts\n"
+            error_msg += "4. Check Python version (requires 3.8-3.11)\n"
+            error_msg += f"Original error: {str(e)}"
+            raise Exception(error_msg)
+        except Exception as e:
+            raise Exception(f"Mozilla TTS error: {str(e)}")
+    
+    def text_to_speech_coqui(self, text: str, model: str = "tts_models/multilingual/multi-dataset/xtts_v2",
+                           speaker: str = None, language: str = "en", reference_audio: bytes = None) -> io.BytesIO:
+        """Convert text to speech using Coqui TTS"""
+        try:
+            # Import Coqui TTS
+            from TTS.api import TTS
+            import tempfile
+            import os
+            
+            # Initialize TTS with model
+            tts = TTS(model_name=model)
+            
+            # Create a temporary file for output
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = temp_file.name
+            
+            # Handle different model types
+            if "xtts_v2" in model:
+                # XTTS v2 supports voice cloning and multilingual
+                if reference_audio and speaker == "custom":
+                    # Voice cloning with uploaded audio
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as ref_file:
+                        ref_file.write(reference_audio)
+                        ref_path = ref_file.name
+                    
+                    try:
+                        tts.tts_to_file(
+                            text=text,
+                            file_path=temp_path,
+                            speaker_wav=ref_path,
+                            language=language
+                        )
+                    finally:
+                        # Clean up reference file
+                        os.unlink(ref_path)
+                        
+                elif speaker:
+                    # Built-in speaker for XTTS v2
+                    tts.tts_to_file(
+                        text=text,
+                        file_path=temp_path,
+                        speaker=speaker,
+                        language=language
+                    )
+                else:
+                    # Default XTTS v2 generation
+                    tts.tts_to_file(
+                        text=text,
+                        file_path=temp_path,
+                        language=language
+                    )
+            else:
+                # Standard TTS models
+                if hasattr(tts.tts, 'speakers') and tts.tts.speakers:
+                    # Multi-speaker model
+                    speakers = tts.tts.speakers
+                    selected_speaker = speaker if speaker in speakers else speakers[0]
+                    tts.tts_to_file(text=text, file_path=temp_path, speaker=selected_speaker)
+                else:
+                    # Single speaker model
+                    tts.tts_to_file(text=text, file_path=temp_path)
+            
+            # Read the generated audio file into BytesIO
+            fp = io.BytesIO()
+            with open(temp_path, 'rb') as audio_file:
+                fp.write(audio_file.read())
+            
+            # Clean up temporary file
+            os.unlink(temp_path)
+            
+            fp.seek(0)
+            return fp
+            
+        except ImportError as e:
+            error_msg = "Coqui TTS not installed. Try these solutions:\n"
+            error_msg += "1. pip install TTS --upgrade\n"
+            error_msg += "2. pip install git+https://github.com/coqui-ai/TTS.git\n"
+            error_msg += "3. conda install -c conda-forge tts\n"
+            error_msg += "4. Check Python version (requires 3.8-3.11)\n"
+            error_msg += f"Original error: {str(e)}"
+            raise Exception(error_msg)
+        except Exception as e:
+            error_msg = f"Coqui TTS error: {str(e)}\n"
+            if "No module named" in str(e):
+                error_msg += "This looks like an installation issue. Please check the installation guide."
+            elif "CUDA" in str(e):
+                error_msg += "GPU/CUDA issue detected. TTS will fall back to CPU processing."
+            elif "model" in str(e).lower():
+                error_msg += "Model loading failed. The model will be downloaded on first use."
+            raise Exception(error_msg)
+    
     def __call__(self, state: TextReaderState) -> TextReaderState:
         """Convert all chunks to speech for workflow usage"""
         return self.convert_all_chunks(state)
@@ -2176,7 +2669,18 @@ class TextToSpeechAgent:
                 voice = tts_settings.get("voice", "alloy")
                 model = tts_settings.get("model", "tts-1-hd")
                 audio_bytes = self.text_to_speech_openai(text, api_key, voice, model)
+            elif tts_engine == "Mozilla TTS (Local)":
+                model = tts_settings.get("model", "tts_models/en/ljspeech/tacotron2-DDC")
+                vocoder = tts_settings.get("vocoder", "vocoder_models/en/ljspeech/hifigan_v2")
+                audio_bytes = self.text_to_speech_mozilla(text, model, vocoder)
+            elif tts_engine == "Coqui TTS (Local)":
+                model = tts_settings.get("model", "tts_models/multilingual/multi-dataset/xtts_v2")
+                speaker = tts_settings.get("speaker")
+                language = tts_settings.get("language", "en")
+                reference_audio = tts_settings.get("reference_audio")  # bytes or None
+                audio_bytes = self.text_to_speech_coqui(text, model, speaker, language, reference_audio)
             else:
+                # Default to Google TTS
                 language = tts_settings.get("language", "en")
                 audio_bytes = self.text_to_speech_gtts(text, language)
             
@@ -2203,15 +2707,71 @@ class TextToSpeechAgent:
     
     def convert_all_chunks(self, state: TextReaderState) -> TextReaderState:
         """Convert all chunks to speech"""
+        import streamlit as st
+        import time
+        
         try:
             processed_chunks = state.get("processed_chunks", [])
             audio_files = []
             
+            if not processed_chunks:
+                return {
+                    **state,
+                    "error_message": "No processed chunks available for TTS conversion"
+                }
+            
+            # Create progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            time_text = st.empty()
+            start_time = time.time()
+            
+            # Time estimates per TTS engine (seconds per 1000 characters)
+            tts_engine = state.get("tts_engine", "Google TTS (Free)")
+            time_estimates = {
+                "Google TTS (Free)": 3,    # 3 seconds per 1000 chars
+                "OpenAI TTS (Premium)": 5, # 5 seconds per 1000 chars
+                "Mozilla TTS (Local)": 8,  # 8 seconds per 1000 chars
+                "Coqui TTS (Local)": 10    # 10 seconds per 1000 chars
+            }
+            est_time_per_1k_chars = time_estimates.get(tts_engine, 5)
+            
             for i, chunk in enumerate(processed_chunks):
+                # Update progress
+                progress = (i + 1) / len(processed_chunks)
+                progress_bar.progress(progress)
+                
+                # Calculate estimates
+                chunk_text = chunk.get("current_text", "")
+                chunk_chars = len(chunk_text)
+                estimated_chunk_time = (chunk_chars / 1000) * est_time_per_1k_chars
+                
+                # Update status
+                status_text.text(f"🎵 Generating speech for chunk {i + 1} of {len(processed_chunks)} ({chunk_chars:,} chars)")
+                
+                # Calculate time estimates
+                elapsed_time = time.time() - start_time
+                if i > 0:
+                    avg_time_per_chunk = elapsed_time / i
+                    remaining_chunks = len(processed_chunks) - i
+                    estimated_remaining = remaining_chunks * avg_time_per_chunk
+                    time_text.text(f"⏱️ Elapsed: {elapsed_time:.1f}s | Estimated remaining: {estimated_remaining:.1f}s")
+                else:
+                    time_text.text(f"⏱️ Starting TTS conversion... Estimated: {estimated_chunk_time:.1f}s for this chunk")
+                
+                chunk_start_time = time.time()
                 result_state = self.convert_chunk(state, i)
+                chunk_time = time.time() - chunk_start_time
+                
                 if result_state.get("error_message"):
                     return result_state
                 audio_files.extend(result_state.get("audio_files", []))
+            
+            # Complete progress tracking
+            progress_bar.progress(1.0)
+            total_time = time.time() - start_time
+            status_text.text(f"✅ Completed generating speech for {len(processed_chunks)} chunks!")
+            time_text.text(f"⏱️ Total time: {total_time:.1f}s | Average: {total_time/len(processed_chunks):.1f}s per chunk")
             
             return {
                 **state,
