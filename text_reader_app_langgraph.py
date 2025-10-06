@@ -6,6 +6,7 @@ Multi-agent system for file processing, text extraction, grammar checking, and T
 import streamlit as st
 import os
 import base64
+import pandas as pd
 from dotenv import load_dotenv
 from agents import (
     create_text_reader_workflow, 
@@ -38,6 +39,333 @@ st.set_page_config(
 
 st.title("Text Reader App - Multi-Agent System")
 st.markdown("*Powered by LangGraph agents for file processing, text extraction, grammar checking, and TTS conversion*")
+
+# JavaScript functions for persistent storage
+def add_persistent_storage_js():
+    """Add JavaScript functions for browser local storage persistence"""
+    storage_js = """
+    <script>
+    // Save session data to localStorage
+    function saveSessionData(key, data) {
+        try {
+            localStorage.setItem('text_reader_' + key, JSON.stringify(data));
+            return true;
+        } catch (e) {
+            console.error('Failed to save session data:', e);
+            return false;
+        }
+    }
+    
+    // Load session data from localStorage
+    function loadSessionData(key) {
+        try {
+            const data = localStorage.getItem('text_reader_' + key);
+            return data ? JSON.parse(data) : null;
+        } catch (e) {
+            console.error('Failed to load session data:', e);
+            return null;
+        }
+    }
+    
+    // Clear session data
+    function clearSessionData(key) {
+        try {
+            if (key) {
+                localStorage.removeItem('text_reader_' + key);
+            } else {
+                // Clear all text_reader data
+                Object.keys(localStorage).forEach(k => {
+                    if (k.startsWith('text_reader_')) {
+                        localStorage.removeItem(k);
+                    }
+                });
+            }
+            return true;
+        } catch (e) {
+            console.error('Failed to clear session data:', e);
+            return false;
+        }
+    }
+    
+    // Auto-save text edits
+    function autoSaveText(textAreaId, key) {
+        const textarea = document.getElementById(textAreaId);
+        if (textarea) {
+            textarea.addEventListener('input', function() {
+                saveSessionData(key, {
+                    text: this.value,
+                    timestamp: Date.now()
+                });
+            });
+        }
+    }
+    
+    // Restore text from storage
+    function restoreText(textAreaId, key) {
+        const data = loadSessionData(key);
+        const textarea = document.getElementById(textAreaId);
+        if (data && textarea && data.text) {
+            textarea.value = data.text;
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    }
+    
+    // Save current session state
+    window.saveCurrentSession = function() {
+        const sessionData = {
+            timestamp: Date.now(),
+            url: window.location.href,
+            scrollPosition: window.scrollY
+        };
+        saveSessionData('current_session', sessionData);
+    };
+    
+    // Auto-save on page unload
+    window.addEventListener('beforeunload', function() {
+        window.saveCurrentSession();
+    });
+    
+    // Save session every 30 seconds
+    setInterval(window.saveCurrentSession, 30000);
+    </script>
+    """
+    st.components.v1.html(storage_js, height=0)
+
+# Add the persistent storage JavaScript
+add_persistent_storage_js()
+
+# Python functions for session persistence
+import json
+import pickle
+import time
+from pathlib import Path
+from typing import List, Dict
+
+def get_session_file_path():
+    """Get the path for session backup file"""
+    session_dir = Path("session_backups")
+    session_dir.mkdir(exist_ok=True)
+    return session_dir / f"session_{st.session_state.get('session_id', 'default')}.pkl"
+
+def get_version_history_path():
+    """Get the path for text version history"""
+    session_dir = Path("session_backups")
+    session_dir.mkdir(exist_ok=True)
+    versions_dir = session_dir / "text_versions"
+    versions_dir.mkdir(exist_ok=True)
+    return versions_dir
+
+def save_text_version(chunk_id: int, text: str, version_type: str = "edit"):
+    """Save a version of text for future retrieval"""
+    try:
+        versions_dir = get_version_history_path()
+        session_id = st.session_state.get('session_id', 'default')
+        
+        # Create version entry
+        version_data = {
+            'text': text,
+            'timestamp': time.time(),
+            'version_type': version_type,  # 'original', 'edit', 'spell_check', 'ai_improve', 'summary'
+            'chunk_id': chunk_id,
+            'session_id': session_id,
+            'word_count': len(text.split()),
+            'char_count': len(text)
+        }
+        
+        # Save to timestamped file
+        timestamp_str = str(int(time.time() * 1000))  # milliseconds for uniqueness
+        filename = f"{session_id}_chunk_{chunk_id}_{version_type}_{timestamp_str}.pkl"
+        filepath = versions_dir / filename
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(version_data, f)
+        
+        # Clean up old versions (keep last 50 per chunk)
+        cleanup_old_versions(chunk_id, session_id)
+        
+        return True
+    except Exception as e:
+        # Silently fail - don't disrupt user experience
+        return False
+
+def cleanup_old_versions(chunk_id: int, session_id: str):
+    """Keep only the last 50 versions per chunk to prevent excessive storage"""
+    try:
+        versions_dir = get_version_history_path()
+        pattern = f"{session_id}_chunk_{chunk_id}_*.pkl"
+        
+        # Get all files for this chunk
+        chunk_files = list(versions_dir.glob(pattern))
+        
+        if len(chunk_files) > 50:
+            # Sort by modification time and keep newest 50
+            chunk_files.sort(key=lambda x: x.stat().st_mtime)
+            for old_file in chunk_files[:-50]:
+                try:
+                    old_file.unlink()
+                except:
+                    pass
+    except:
+        pass
+
+def get_text_versions(chunk_id: int, session_id: str = None) -> List[Dict]:
+    """Get all saved versions for a specific chunk"""
+    try:
+        if session_id is None:
+            session_id = st.session_state.get('session_id', 'default')
+            
+        versions_dir = get_version_history_path()
+        pattern = f"{session_id}_chunk_{chunk_id}_*.pkl"
+        
+        versions = []
+        for filepath in versions_dir.glob(pattern):
+            try:
+                with open(filepath, 'rb') as f:
+                    version_data = pickle.load(f)
+                    version_data['filepath'] = filepath
+                    versions.append(version_data)
+            except:
+                continue
+        
+        # Sort by timestamp (newest first)
+        versions.sort(key=lambda x: x['timestamp'], reverse=True)
+        return versions
+    except:
+        return []
+
+def get_all_session_versions(session_id: str = None) -> Dict[int, List[Dict]]:
+    """Get all saved versions grouped by chunk_id"""
+    try:
+        if session_id is None:
+            session_id = st.session_state.get('session_id', 'default')
+            
+        versions_dir = get_version_history_path()
+        pattern = f"{session_id}_chunk_*.pkl"
+        
+        grouped_versions = {}
+        for filepath in versions_dir.glob(pattern):
+            try:
+                with open(filepath, 'rb') as f:
+                    version_data = pickle.load(f)
+                    chunk_id = version_data['chunk_id']
+                    
+                    if chunk_id not in grouped_versions:
+                        grouped_versions[chunk_id] = []
+                    
+                    version_data['filepath'] = filepath
+                    grouped_versions[chunk_id].append(version_data)
+            except:
+                continue
+        
+        # Sort each chunk's versions by timestamp
+        for chunk_id in grouped_versions:
+            grouped_versions[chunk_id].sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        return grouped_versions
+    except:
+        return {}
+
+def save_session_backup():
+    """Save current session state to file as backup"""
+    try:
+        # Create a serializable copy of session state
+        session_backup = {}
+        
+        # Save important session data
+        for key in ['current_state', 'processing_complete', 'file_order', 
+                   'current_ai_provider', 'current_spell_check_ai', 
+                   'current_ollama_url', 'current_ollama_model', 'current_ollama_timeout',
+                   'current_tts_engine', 'current_tts_settings', 'grammar_analyses']:
+            if key in st.session_state:
+                try:
+                    # Try to pickle each item to ensure it's serializable
+                    pickle.dumps(st.session_state[key])
+                    session_backup[key] = st.session_state[key]
+                except:
+                    # Skip non-serializable items
+                    continue
+        
+        # Save editing sessions (these are critical for recovery)
+        editing_sessions = {}
+        for key, value in st.session_state.items():
+            if key.startswith('editing_session_'):
+                try:
+                    pickle.dumps(value)
+                    editing_sessions[key] = value
+                except:
+                    continue
+        
+        if editing_sessions:
+            session_backup['editing_sessions'] = editing_sessions
+        
+        # Save timestamp
+        session_backup['backup_timestamp'] = time.time()
+        
+        # Write to file
+        session_file = get_session_file_path()
+        with open(session_file, 'wb') as f:
+            pickle.dump(session_backup, f)
+            
+        return True
+    except Exception as e:
+        st.error(f"Failed to save session backup: {str(e)}")
+        return False
+
+def load_session_backup():
+    """Load session state from backup file"""
+    try:
+        session_file = get_session_file_path()
+        if not session_file.exists():
+            return False
+            
+        with open(session_file, 'rb') as f:
+            session_backup = pickle.load(f)
+        
+        # Check if backup is recent (within last 24 hours)
+        backup_time = session_backup.get('backup_timestamp', 0)
+        if time.time() - backup_time > 86400:  # 24 hours
+            return False
+        
+        # Restore session state
+        for key, value in session_backup.items():
+            if key not in ['backup_timestamp', 'editing_sessions']:
+                st.session_state[key] = value
+        
+        # Restore editing sessions
+        if 'editing_sessions' in session_backup:
+            for key, value in session_backup['editing_sessions'].items():
+                st.session_state[key] = value
+        
+        return True
+    except Exception as e:
+        # Silently fail - don't show error for missing backups
+        return False
+
+def auto_save_session():
+    """Auto-save session if there's important data"""
+    if (st.session_state.get('current_state') and 
+        st.session_state.current_state.get('extracted_texts')):
+        save_session_backup()
+        
+    # Process any queued text versions
+    process_queued_text_versions()
+
+def process_queued_text_versions():
+    """Process text versions that were queued for saving"""
+    if 'text_versions_to_save' in st.session_state:
+        versions_to_save = st.session_state.text_versions_to_save
+        for version_data in versions_to_save:
+            save_text_version(
+                version_data['chunk_id'],
+                version_data['text'],
+                version_data['version_type']
+            )
+        # Clear the queue
+        del st.session_state.text_versions_to_save
+
+# Initialize session ID for backup tracking
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = str(int(time.time()))
 
 def get_audio_download_link(audio_bytes, filename="speech.mp3"):
     """Generate download link for audio file"""
@@ -113,6 +441,69 @@ def initialize_session_state():
 # Initialize session state
 initialize_session_state()
 
+# Session recovery functionality
+def check_and_offer_recovery():
+    """Check for previous session and offer recovery"""
+    # Only offer recovery if current session is empty
+    if (not st.session_state.current_state.get('extracted_texts') and 
+        'recovery_offered' not in st.session_state):
+        
+        st.session_state.recovery_offered = True
+        
+        # Check for backup
+        session_file = get_session_file_path()
+        if session_file.exists():
+            try:
+                with open(session_file, 'rb') as f:
+                    session_backup = pickle.load(f)
+                
+                backup_time = session_backup.get('backup_timestamp', 0)
+                if backup_time and (time.time() - backup_time < 86400):  # Within 24 hours
+                    from datetime import datetime
+                    backup_date = datetime.fromtimestamp(backup_time).strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    # Show recovery option
+                    st.info(f"🔄 **Session Recovery Available**")
+                    st.write(f"Found previous session backup from {backup_date}")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        if st.button("🔄 Restore Previous Session", key="restore_session"):
+                            if load_session_backup():
+                                st.success("✅ Session restored successfully!")
+                                st.rerun()
+                            else:
+                                st.error("❌ Failed to restore session")
+                    
+                    with col2:
+                        if st.button("🗑️ Delete Backup", key="delete_backup"):
+                            try:
+                                session_file.unlink()
+                                st.success("✅ Backup deleted")
+                                st.rerun()
+                            except:
+                                st.error("❌ Failed to delete backup")
+                    
+                    with col3:
+                        if st.button("▶️ Start Fresh", key="start_fresh"):
+                            st.session_state.recovery_handled = True
+                            st.rerun()
+                    
+                    st.markdown("---")
+                    return True
+            except:
+                pass
+    
+    return False
+
+# Check for session recovery (only once per session)
+recovery_shown = check_and_offer_recovery()
+
+# Auto-save current session periodically
+if st.session_state.current_state.get('extracted_texts'):
+    auto_save_session()
+
 # Sidebar for settings
 st.sidebar.header("⚙️ Agent Settings")
 
@@ -171,16 +562,42 @@ if ai_provider == "OpenAI":
         )
 # Show Ollama settings if any AI provider uses Ollama
 if ai_provider == "Ollama" or spell_check_ai == "Ollama" or summarization_ai == "Ollama":
+    # Try to load Ollama settings from environment first
+    env_ollama_url = os.getenv("OLLAMA_URL")
+    env_ollama_model = os.getenv("OLLAMA_MODEL")
+    env_ollama_timeout = os.getenv("OLLAMA_TIMEOUT")
+    
+    # Always show editable fields, but populate with .env values as defaults
+    if env_ollama_url or env_ollama_model or env_ollama_timeout:
+        st.sidebar.success("✅ Using Ollama defaults from .env file (editable below)")
+    
     ollama_url = st.sidebar.text_input(
         "Ollama URL",
-        value="http://localhost:11434",
-        help="URL of your Ollama server (default: http://localhost:11434)"
+        value=env_ollama_url if env_ollama_url else "http://localhost:11434",
+        help="URL of your Ollama server. Default from .env file if configured."
     )
     
     ollama_model = st.sidebar.text_input(
         "Ollama Model",
-        value="llama2",
-        help="Ollama model name (e.g., llama2, mistral, codellama)"
+        value=env_ollama_model if env_ollama_model else "llama2",
+        help="Ollama model name (e.g., llama2, mistral, codellama). Default from .env file if configured."
+    )
+    
+    # Parse timeout from env (default to 180 if not set or invalid)
+    default_timeout = 180
+    if env_ollama_timeout:
+        try:
+            default_timeout = int(env_ollama_timeout)
+        except ValueError:
+            default_timeout = 180
+    
+    ollama_timeout = st.sidebar.number_input(
+        "Ollama Timeout (seconds)",
+        min_value=30,
+        max_value=600,
+        value=default_timeout,
+        step=30,
+        help="Timeout for Ollama requests in seconds. Default from .env file if configured."
     )
     
     if st.sidebar.button("🔍 Test Ollama Connection"):
@@ -205,6 +622,13 @@ else:
 # Resolve AI provider settings
 actual_spell_check_ai = ai_provider if spell_check_ai == "Use Default" else spell_check_ai
 actual_summarization_ai = ai_provider if summarization_ai == "Use Default" else summarization_ai
+
+# Store AI provider settings in session state for parallel editor access
+st.session_state.current_ai_provider = ai_provider
+st.session_state.current_spell_check_ai = actual_spell_check_ai
+st.session_state.current_ollama_url = ollama_url
+st.session_state.current_ollama_model = ollama_model
+st.session_state.current_ollama_timeout = ollama_timeout if (ai_provider == "Ollama" or spell_check_ai == "Ollama" or summarization_ai == "Ollama") else 180
 
 # OpenAI TTS Settings (only if using OpenAI TTS)
 if tts_engine == "OpenAI TTS (Premium)":
@@ -440,6 +864,906 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
+# HTML Import Section
+st.header("📄 Import Previous Export")
+html_import_files = st.file_uploader(
+    "Import HTML Exports",
+    type=['html', 'htm'],
+    help="Import previously exported HTML files to resummarize content (supports multiple files)",
+    key="html_import",
+    accept_multiple_files=True
+)
+
+if html_import_files:
+    st.subheader("🔄 Processing HTML Import")
+    st.info(f"📁 Processing {len(html_import_files)} HTML file(s)")
+    
+    # HTML File ordering interface
+    st.subheader("📋 HTML File Order")
+    
+    # Initialize HTML file order in session state
+    if 'html_file_order' not in st.session_state or len(st.session_state.html_file_order) != len(html_import_files):
+        st.session_state.html_file_order = list(range(len(html_import_files)))
+    
+    # Display current HTML file order with reordering controls
+    for i, file_idx in enumerate(st.session_state.html_file_order):
+        col1, col2, col3 = st.columns([4, 1, 1])
+        with col1:
+            st.write(f"{i+1}. {html_import_files[file_idx].name}")
+        with col2:
+            if st.button("⬆️", key=f"html_up_{i}", help="Move up"):
+                if i > 0:
+                    st.session_state.html_file_order[i], st.session_state.html_file_order[i-1] = \
+                        st.session_state.html_file_order[i-1], st.session_state.html_file_order[i]
+                    st.rerun()
+        with col3:
+            if st.button("⬇️", key=f"html_down_{i}", help="Move down"):
+                if i < len(st.session_state.html_file_order) - 1:
+                    st.session_state.html_file_order[i], st.session_state.html_file_order[i+1] = \
+                        st.session_state.html_file_order[i+1], st.session_state.html_file_order[i]
+                    st.rerun()
+    
+    def perform_hierarchical_summarization(content, filename, ai_provider, api_key, target_length, ollama_url=None, ollama_model=None, ollama_timeout=180):
+        """Perform hierarchical summarization: chunk -> summarize chunks -> combine summaries"""
+        
+        # Initialize text processor if not already done
+        if 'text_processor' not in st.session_state:
+            st.session_state.text_processor = TextProcessingAgent()
+        
+        # If content is small enough, summarize directly with paragraph formatting
+        max_chars_per_chunk = 12000  # ~3000 tokens per chunk, safe for rate limits
+        if len(content) <= max_chars_per_chunk:
+            direct_prompt = f"""Please create a comprehensive summary of the following text in approximately {target_length} words.
+
+CRITICAL FORMATTING REQUIREMENT: Your entire response must be written in well-structured paragraph form only. Do NOT use:
+- Bullet points or numbered lists
+- Headers or subheadings
+- Dashes or other list-style formatting
+- Line breaks that create artificial separation between related ideas
+
+Write your summary as continuous, flowing paragraphs with smooth transitions between ideas. Each paragraph should focus on related themes and naturally lead to the next.
+
+Text to summarize:
+{content}"""
+            
+            if ai_provider == "OpenAI":
+                from openai import OpenAI
+                client = OpenAI(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": direct_prompt}],
+                    max_tokens=4000,
+                    temperature=0.3
+                )
+                return response.choices[0].message.content.strip()
+            else:
+                from agents import OllamaClient
+                ollama_client = OllamaClient(base_url=ollama_url)
+                return ollama_client.generate_completion(
+                    model=ollama_model,
+                    prompt=direct_prompt,
+                    timeout=ollama_timeout
+                )
+        
+        # Step 1: Split into chunks
+        chunks = st.session_state.text_processor.split_text_into_chunks(content)
+        
+        with st.expander(f"📊 Hierarchical Processing Details - {filename}"):
+            st.info(f"Split into {len(chunks)} chunks (max {max_chars_per_chunk:,} chars each)")
+            
+            # Step 2: Summarize each chunk
+            chunk_summaries = []
+            chunk_progress = st.progress(0)
+            chunk_status = st.empty()
+            
+            for i, chunk in enumerate(chunks):
+                progress_pct = (i + 1) / len(chunks)
+                chunk_progress.progress(progress_pct)
+                chunk_status.text(f"Summarizing chunk {i + 1} of {len(chunks)} ({len(chunk):,} chars)")
+                
+                # Summarize this chunk with a smaller target length
+                chunk_target_length = max(50, target_length // len(chunks))  # Proportional length per chunk
+                
+                try:
+                    # Create paragraph-specific prompt for chunk summarization
+                    chunk_prompt = f"""Please create a comprehensive summary of the following text in approximately {chunk_target_length} words.
+
+CRITICAL FORMATTING REQUIREMENT: Your entire response must be written in well-structured paragraph form only. Do NOT use:
+- Bullet points or numbered lists
+- Headers or subheadings
+- Dashes or other list-style formatting
+- Line breaks that create artificial separation between related ideas
+
+Write your summary as continuous, flowing paragraphs with smooth transitions between ideas.
+
+Text to summarize:
+{chunk}"""
+
+                    if ai_provider == "OpenAI":
+                        from openai import OpenAI
+                        client = OpenAI(api_key=api_key)
+                        response = client.chat.completions.create(
+                            model="gpt-3.5-turbo",
+                            messages=[{"role": "user", "content": chunk_prompt}],
+                            max_tokens=2000,
+                            temperature=0.3
+                        )
+                        chunk_summary = response.choices[0].message.content.strip()
+                    else:
+                        from agents import OllamaClient
+                        ollama_client = OllamaClient(base_url=ollama_url)
+                        chunk_summary = ollama_client.generate_completion(
+                            model=ollama_model,
+                            prompt=chunk_prompt,
+                            timeout=ollama_timeout
+                        )
+                    
+                    chunk_summaries.append(chunk_summary)
+                    
+                except Exception as e:
+                    st.warning(f"Failed to summarize chunk {i + 1}: {str(e)}")
+                    # Fallback: use first part of chunk as summary
+                    fallback_summary = chunk[:500] + "..." if len(chunk) > 500 else chunk
+                    chunk_summaries.append(fallback_summary)
+            
+            chunk_progress.empty()
+            chunk_status.empty()
+            
+            st.success(f"✅ Completed chunk summaries: {len(chunk_summaries)} summaries generated")
+        
+        # Step 3: Combine chunk summaries into final summary
+        combined_chunk_summaries = "\n\n".join([f"Section {i+1}: {summary}" for i, summary in enumerate(chunk_summaries)])
+        
+        # If combined summaries are still too long, recursively apply hierarchical summarization
+        if len(combined_chunk_summaries) > max_chars_per_chunk:
+            st.info("🔄 Combined summaries are large, applying second-level summarization...")
+            return perform_hierarchical_summarization(
+                combined_chunk_summaries, f"{filename}_level2", ai_provider, api_key, 
+                target_length, ollama_url, ollama_model, ollama_timeout
+            )
+        
+        # Final summarization of combined chunk summaries
+        final_prompt = f"""You are an expert text synthesizer. The following are summaries of different sections from a document called '{filename}'. 
+
+Please create a comprehensive final summary of approximately {target_length} words that:
+1. Captures the main themes and key points from all sections
+2. Synthesizes the information into a coherent narrative
+3. Maintains logical flow between ideas
+
+CRITICAL FORMATTING REQUIREMENT: Your entire response must be written in well-structured paragraph form only. Do NOT use:
+- Bullet points or numbered lists
+- Headers or subheadings  
+- Dashes or other list-style formatting
+- Line breaks that create artificial separation between related ideas
+
+Write your summary as continuous, flowing paragraphs with smooth transitions between ideas. Each paragraph should focus on related themes and naturally lead to the next.
+
+Section summaries to synthesize:
+
+{combined_chunk_summaries}"""
+        
+        try:
+            # Direct AI call for final synthesis to use custom prompt
+            if ai_provider == "OpenAI":
+                from openai import OpenAI
+                client = OpenAI(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "user", "content": final_prompt}
+                    ],
+                    max_tokens=4000,
+                    temperature=0.3
+                )
+                final_summary = response.choices[0].message.content.strip()
+                
+            else:  # Ollama
+                from agents import OllamaClient
+                ollama_client = OllamaClient(base_url=ollama_url)
+                final_summary = ollama_client.generate_completion(
+                    model=ollama_model,
+                    prompt=final_prompt,
+                    timeout=timeout
+                )
+            
+            return final_summary
+            
+        except Exception as e:
+            st.error(f"Failed to create final summary: {str(e)}")
+            # Fallback: return combined summaries
+            return combined_chunk_summaries
+    
+    # Store extracted content from all files
+    extracted_contents = {}
+    total_chars = 0
+    
+    try:
+        from bs4 import BeautifulSoup
+        import re
+        
+        # Process each HTML file in the specified order
+        for i, file_idx in enumerate(st.session_state.html_file_order):
+            html_file = html_import_files[file_idx]
+            with st.spinner(f"Processing file {i+1}/{len(html_import_files)}: {html_file.name}"):
+                # Read HTML content
+                html_content = html_file.read().decode('utf-8')
+                
+                # Parse HTML and extract text content
+                soup = BeautifulSoup(html_content, 'html.parser')
+                
+                # Extract text content from the HTML
+                extracted_text = soup.get_text()
+                
+                # Clean up the text (remove extra whitespace)
+                cleaned_text = re.sub(r'\s+', ' ', extracted_text).strip()
+                
+                # Store the content with ordering information
+                extracted_contents[html_file.name] = cleaned_text
+                total_chars += len(cleaned_text)
+        
+        st.success(f"✅ Successfully imported {len(html_import_files)} HTML files")
+        st.info(f"📊 Total extracted: {total_chars:,} characters")
+        
+        # Show summary of all files in the specified order
+        with st.expander("📋 Files Summary"):
+            for file_idx in st.session_state.html_file_order:
+                filename = html_import_files[file_idx].name
+                content = extracted_contents[filename]
+                st.markdown(f"**{file_idx + 1}. {filename}**: {len(content):,} characters")
+        
+        # Show preview of extracted content from all files in the specified order
+        with st.expander("👁️ Preview All Extracted Content"):
+            for file_idx in st.session_state.html_file_order:
+                filename = html_import_files[file_idx].name
+                content = extracted_contents[filename]
+                st.markdown(f"### {file_idx + 1}. {filename}")
+                preview_text = content[:500] + "..." if len(content) > 500 else content
+                st.text_area(f"Preview - {filename}", preview_text, height=150, disabled=True, key=f"preview_{filename}")
+        
+        # Resummarization options
+        st.subheader("⚙️ Resummarization Settings")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            target_length = st.number_input(
+                "Target Summary Length (words)", 
+                min_value=100, 
+                max_value=1000, 
+                value=350, 
+                step=50,
+                help="Target length for the resummarized content"
+            )
+        
+        with col2:
+            ai_provider = st.selectbox(
+                "AI Provider",
+                options=["OpenAI", "Ollama"],
+                help="Choose AI provider for resummarization"
+            )
+        
+        with col3:
+            processing_mode = st.selectbox(
+                "Processing Mode",
+                options=["Individual Files", "Combined Content"],
+                help="Process files individually or combine all content before summarization"
+            )
+        
+        # Ollama settings (if selected)
+        if ai_provider == "Ollama":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                ollama_url = st.text_input("Ollama URL", value=st.session_state.get('current_ollama_url', ''))
+            with col2:
+                ollama_model = st.text_input("Ollama Model", value=st.session_state.get('current_ollama_model', ''))
+            with col3:
+                ollama_timeout = st.number_input("Ollama Timeout (seconds)", min_value=30, max_value=600, value=st.session_state.get('current_ollama_timeout', 180))
+        
+        # Resummarize button
+        if st.button("🔄 Resummarize Content", type="primary"):
+            try:
+                # Initialize text processor if needed (has summarization functionality)
+                from agents import TextProcessingAgent
+                if 'text_processor' not in st.session_state:
+                    st.session_state.text_processor = TextProcessingAgent()
+                
+                # Get API key
+                api_key = None
+                if ai_provider == "OpenAI":
+                    api_key = os.getenv('OPENAI_API_KEY')
+                    if not api_key:
+                        st.error("OpenAI API key not found in environment variables")
+                        st.stop()
+                
+                resummarized_results = {}
+                
+                if processing_mode == "Individual Files":
+                    # Process each file individually
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for i, file_idx in enumerate(st.session_state.html_file_order):
+                        filename = html_import_files[file_idx].name
+                        content = extracted_contents[filename]
+                        progress = (i + 1) / len(extracted_contents)
+                        progress_bar.progress(progress)
+                        status_text.text(f"Processing {filename} ({i+1}/{len(extracted_contents)})")
+                        
+                        # Perform hierarchical summarization for large content
+                        resummarized_text = perform_hierarchical_summarization(
+                            content, filename, ai_provider, api_key, target_length,
+                            ollama_url, ollama_model, ollama_timeout
+                        )
+                        
+                        resummarized_results[filename] = resummarized_text
+                    
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.success(f"✅ Successfully resummarized {len(extracted_contents)} files individually!")
+                
+                else:  # Combined Content
+                    with st.spinner("Combining and resummarizing all content..."):
+                        # Combine all content with file separators in the specified order
+                        combined_content = ""
+                        for file_idx in st.session_state.html_file_order:
+                            filename = html_import_files[file_idx].name
+                            content = extracted_contents[filename]
+                            combined_content += f"\n\n=== Content from {filename} ===\n\n{content}"
+                        
+                        # Perform hierarchical summarization on combined content
+                        combined_summary = perform_hierarchical_summarization(
+                            combined_content, "combined_import", ai_provider, api_key, target_length,
+                            ollama_url, ollama_model, ollama_timeout
+                        )
+                        
+                        resummarized_results["combined_summary"] = combined_summary
+                        st.success("✅ Successfully created combined resummarized content!")
+                
+                # Display resummarized content
+                st.subheader("📝 Resummarized Content")
+                
+                if processing_mode == "Individual Files":
+                    # Show individual results in the specified order with editing capability
+                    for file_idx in st.session_state.html_file_order:
+                        filename = html_import_files[file_idx].name
+                        if filename in resummarized_results:
+                            result = resummarized_results[filename]
+                            
+                            with st.expander(f"📄 {filename}", expanded=False):
+                                # Initialize editable content for this file
+                                individual_key = f"editable_individual_{filename}_{pd.Timestamp.now().strftime('%Y%m%d')}"
+                                if individual_key not in st.session_state:
+                                    st.session_state[individual_key] = result
+                                
+                                # Create columns for edit toggle
+                                col1, col2 = st.columns([3, 1])
+                                with col2:
+                                    edit_mode = st.toggle("✏️ Edit", key=f"edit_toggle_{filename}")
+                                
+                                if edit_mode:
+                                    # Editable text area for individual file
+                                    edited_content = st.text_area(
+                                        f"Edit Summary - {filename}",
+                                        value=st.session_state[individual_key],
+                                        height=250,
+                                        help="Edit the summary content. Changes are automatically saved.",
+                                        key=f"individual_editor_{filename}"
+                                    )
+                                    
+                                    # Update session state when content changes
+                                    if edited_content != st.session_state[individual_key]:
+                                        st.session_state[individual_key] = edited_content
+                                        st.success("✅ Changes saved automatically!")
+                                    
+                                    # Show character and word count
+                                    char_count = len(edited_content)
+                                    word_count = len(edited_content.split())
+                                    st.caption(f"📊 {char_count:,} characters, {word_count:,} words")
+                                    
+                                    # Reset button for individual file
+                                    if st.button("🔄 Reset to Original", key=f"reset_{filename}", help="Restore original AI-generated summary"):
+                                        st.session_state[individual_key] = result
+                                        st.rerun()
+                                
+                                else:
+                                    # Read-only view for individual file
+                                    st.text_area(f"Summary - {filename} (Read-only)", st.session_state[individual_key], height=200, disabled=True, key=f"readonly_{filename}")
+                                    
+                                    # Show if content has been edited
+                                    if st.session_state[individual_key] != result:
+                                        st.info("ℹ️ This content has been edited. Toggle Edit Mode to make changes.")
+                                
+                                # Individual file save options
+                                st.markdown("**Save Options:**")
+                                col1, col2, col3 = st.columns(3)
+                                
+                                with col1:
+                                    # Save as text
+                                    if st.button("💾 Text", key=f"save_text_{filename}", help="Save as text file"):
+                                        content_to_save = st.session_state.get(individual_key, result)
+                                        st.download_button(
+                                            "Download Text",
+                                            content_to_save,
+                                            file_name=f"individual_{filename.replace('.html', '').replace('.htm', '')}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                            mime="text/plain",
+                                            key=f"download_text_{filename}"
+                                        )
+                                
+                                with col2:
+                                    # Save as HTML
+                                    if st.button("🌐 HTML", key=f"save_html_{filename}", help="Save as HTML file"):
+                                        content_to_save = st.session_state.get(individual_key, result)
+                                        
+                                        # Check if content has been edited
+                                        edited_indicator = ""
+                                        if st.session_state.get(individual_key) != result:
+                                            edited_indicator = "<br>⚠️ Content has been manually edited"
+                                        
+                                        html_output = f"""
+                                        <!DOCTYPE html>
+                                        <html>
+                                        <head>
+                                            <title>Summary - {filename}</title>
+                                            <meta charset="UTF-8">
+                                            <style>
+                                                body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+                                                .header {{ border-bottom: 2px solid #333; padding-bottom: 20px; margin-bottom: 30px; }}
+                                                .content {{ max-width: 800px; }}
+                                                .meta {{ color: #666; font-size: 0.9em; margin-bottom: 20px; }}
+                                            </style>
+                                        </head>
+                                        <body>
+                                            <div class="header">
+                                                <h1>Individual File Summary</h1>
+                                                <div class="meta">
+                                                    Source File: {filename}<br>
+                                                    Resummarized on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
+                                                    Target Length: {target_length} words<br>
+                                                    AI Provider: {ai_provider}<br>
+                                                    Processing Mode: Individual Files{edited_indicator}
+                                                </div>
+                                            </div>
+                                            <div class="content">
+                                                <p>{content_to_save.replace(chr(10), '</p><p>')}</p>
+                                            </div>
+                                        </body>
+                                        </html>
+                                        """
+                                        st.download_button(
+                                            "Download HTML",
+                                            html_output,
+                                            file_name=f"individual_{filename.replace('.html', '').replace('.htm', '')}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.html",
+                                            mime="text/html",
+                                            key=f"download_html_{filename}"
+                                        )
+                                
+                                with col3:
+                                    # Add to session for further editing
+                                    if st.button("📝 Session", key=f"save_session_{filename}", help="Add to session for further editing"):
+                                        if 'extracted_texts' not in st.session_state:
+                                            st.session_state.extracted_texts = {}
+                                        
+                                        content_to_save = st.session_state.get(individual_key, result)
+                                        chunk_key = f"html_individual_{filename}_{pd.Timestamp.now().strftime('%H%M%S')}"
+                                        st.session_state.extracted_texts[chunk_key] = content_to_save
+                                        
+                                        st.success("✅ Added to session!")
+                                
+                                # Additional options for edited individual files
+                                if st.session_state.get(individual_key) != result:
+                                    st.markdown("---")
+                                    st.markdown("**📝 Edit Options:**")
+                                    
+                                    col1, col2 = st.columns(2)
+                                    
+                                    with col1:
+                                        # Save comparison for individual file
+                                        if st.button("📊 Comparison", key=f"comparison_{filename}", help="Download original vs edited comparison"):
+                                            original_content = result
+                                            edited_content = st.session_state.get(individual_key, "")
+                                            
+                                            comparison_content = f"""INDIVIDUAL FILE SUMMARY COMPARISON
+File: {filename}
+Generated on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{'='*60}
+ORIGINAL AI-GENERATED SUMMARY
+{'='*60}
+
+{original_content}
+
+{'='*60}
+EDITED VERSION
+{'='*60}
+
+{edited_content}
+
+{'='*60}
+METADATA
+{'='*60}
+
+Source File: {filename}
+Target Length: {target_length} words
+AI Provider: {ai_provider}
+Processing Mode: Individual Files
+"""
+                                            st.download_button(
+                                                "Download Comparison",
+                                                comparison_content,
+                                                file_name=f"comparison_{filename.replace('.html', '').replace('.htm', '')}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                                mime="text/plain",
+                                                key=f"download_comparison_{filename}"
+                                            )
+                                    
+                                    with col2:
+                                        # Show edit statistics for individual file
+                                        if st.button("📈 Stats", key=f"stats_{filename}", help="View editing statistics"):
+                                            original = result
+                                            edited = st.session_state.get(individual_key, "")
+                                            
+                                            orig_words = len(original.split())
+                                            edit_words = len(edited.split())
+                                            orig_chars = len(original)
+                                            edit_chars = len(edited)
+                                            
+                                            st.info(f"""
+**Edit Stats for {filename}:**
+- Original: {orig_words:,} words, {orig_chars:,} chars
+- Edited: {edit_words:,} words, {edit_chars:,} chars  
+- Change: {edit_words - orig_words:+,} words ({((edit_words - orig_words) / orig_words * 100) if orig_words > 0 else 0:.1f}%)
+                                            """)
+                else:
+                    # Show combined result with editing capability
+                    st.markdown("#### Combined Summary")
+                    
+                    # Initialize editable content in session state if not exists
+                    combined_key = f"editable_combined_summary_{pd.Timestamp.now().strftime('%Y%m%d')}"
+                    if combined_key not in st.session_state:
+                        st.session_state[combined_key] = resummarized_results["combined_summary"]
+                    
+                    # Create two columns for view/edit toggle
+                    col1, col2 = st.columns([3, 1])
+                    with col2:
+                        edit_mode = st.toggle("✏️ Edit Mode", key="combined_edit_toggle")
+                    
+                    if edit_mode:
+                        # Editable text area
+                        edited_content = st.text_area(
+                            "Edit Combined Summary",
+                            value=st.session_state[combined_key],
+                            height=400,
+                            help="Edit the combined summary content. Changes are automatically saved.",
+                            key="combined_summary_editor"
+                        )
+                        
+                        # Update session state when content changes
+                        if edited_content != st.session_state[combined_key]:
+                            st.session_state[combined_key] = edited_content
+                            st.success("✅ Changes saved automatically!")
+                        
+                        # Show character and word count
+                        char_count = len(edited_content)
+                        word_count = len(edited_content.split())
+                        st.caption(f"📊 {char_count:,} characters, {word_count:,} words")
+                        
+                        # Reset button
+                        if st.button("🔄 Reset to Original", help="Restore original AI-generated summary"):
+                            st.session_state[combined_key] = resummarized_results["combined_summary"]
+                            st.rerun()
+                    
+                    else:
+                        # Read-only view
+                        st.text_area("Combined Summary (Read-only)", st.session_state[combined_key], height=400, disabled=True)
+                        
+                        # Show if content has been edited
+                        if st.session_state[combined_key] != resummarized_results["combined_summary"]:
+                            st.info("ℹ️ This content has been edited. Toggle Edit Mode to make changes.")
+                    
+                # Save options
+                st.subheader("💾 Save Options")
+                
+                if processing_mode == "Individual Files":
+                    # Bulk save options for individual files
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        # Save all as individual text files (ZIP)
+                        if st.button("📦 Download All as Text (ZIP)"):
+                            import zipfile
+                            import io
+                            
+                            zip_buffer = io.BytesIO()
+                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                                for file_idx in st.session_state.html_file_order:
+                                    filename = html_import_files[file_idx].name
+                                    if filename in resummarized_results:
+                                        # Use edited content if available
+                                        individual_key = f"editable_individual_{filename}_{pd.Timestamp.now().strftime('%Y%m%d')}"
+                                        content = st.session_state.get(individual_key, resummarized_results[filename])
+                                        text_filename = f"{file_idx + 1:02d}_resummarized_{filename.replace('.html', '').replace('.htm', '')}.txt"
+                                        zip_file.writestr(text_filename, content)
+                            
+                            st.download_button(
+                                "Download ZIP File",
+                                zip_buffer.getvalue(),
+                                file_name=f"bulk_resummarized_text_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                                mime="application/zip"
+                            )
+                    
+                    with col2:
+                        # Save all as individual HTML files (ZIP)
+                        if st.button("🌐 Download All as HTML (ZIP)"):
+                            import zipfile
+                            import io
+                            
+                            zip_buffer = io.BytesIO()
+                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                                for file_idx in st.session_state.html_file_order:
+                                    filename = html_import_files[file_idx].name
+                                    if filename in resummarized_results:
+                                        # Use edited content if available
+                                        individual_key = f"editable_individual_{filename}_{pd.Timestamp.now().strftime('%Y%m%d')}"
+                                        content = st.session_state.get(individual_key, resummarized_results[filename])
+                                        
+                                        # Check if content has been edited for HTML metadata
+                                        edited_indicator = ""
+                                        if st.session_state.get(individual_key) != resummarized_results.get(filename):
+                                            edited_indicator = "<br>⚠️ Content has been manually edited"
+                                        
+                                        html_content = f"""
+                                    <!DOCTYPE html>
+                                    <html>
+                                    <head>
+                                        <title>Resummarized Content - {filename}</title>
+                                        <meta charset="UTF-8">
+                                        <style>
+                                            body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+                                            .header {{ border-bottom: 2px solid #333; padding-bottom: 20px; margin-bottom: 30px; }}
+                                            .content {{ max-width: 800px; }}
+                                            .meta {{ color: #666; font-size: 0.9em; margin-bottom: 20px; }}
+                                        </style>
+                                    </head>
+                                    <body>
+                                        <div class="header">
+                                            <h1>Resummarized Content</h1>
+                                            <div class="meta">
+                                                Original File: {filename}<br>
+                                                Resummarized on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
+                                                Target Length: {target_length} words<br>
+                                                AI Provider: {ai_provider}<br>
+                                                Processing Mode: {processing_mode}{edited_indicator}
+                                            </div>
+                                        </div>
+                                        <div class="content">
+                                            <p>{content.replace(chr(10), '</p><p>')}</p>
+                                        </div>
+                                    </body>
+                                    </html>
+                                        """
+                                        html_filename = f"{file_idx + 1:02d}_resummarized_{filename.replace('.html', '').replace('.htm', '')}.html"
+                                        zip_file.writestr(html_filename, html_content)
+                            
+                            st.download_button(
+                                "Download ZIP File",
+                                zip_buffer.getvalue(),
+                                file_name=f"bulk_resummarized_html_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                                mime="application/zip"
+                            )
+                    
+                    with col3:
+                        # Save combined into single file
+                        if st.button("📄 Download as Single Combined File"):
+                            combined_text = ""
+                            for file_idx in st.session_state.html_file_order:
+                                filename = html_import_files[file_idx].name
+                                if filename in resummarized_results:
+                                    # Use edited content if available
+                                    individual_key = f"editable_individual_{filename}_{pd.Timestamp.now().strftime('%Y%m%d')}"
+                                    content = st.session_state.get(individual_key, resummarized_results[filename])
+                                    
+                                    # Add edit indicator if content was modified
+                                    edit_status = " [EDITED]" if st.session_state.get(individual_key) != resummarized_results.get(filename) else ""
+                                    combined_text += f"\n\n{'='*60}\nFROM: {file_idx + 1}. {filename}{edit_status}\n{'='*60}\n\n{content}\n"
+                            
+                            st.download_button(
+                                "Download Combined Text File",
+                                combined_text,
+                                file_name=f"combined_resummarized_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                mime="text/plain"
+                            )
+                    
+                    with col4:
+                        # Add all to session for further editing
+                        if st.button("📝 Add All to Session"):
+                            if 'extracted_texts' not in st.session_state:
+                                st.session_state.extracted_texts = {}
+                            
+                            for file_idx in st.session_state.html_file_order:
+                                filename = html_import_files[file_idx].name
+                                if filename in resummarized_results:
+                                    # Use edited content if available
+                                    individual_key = f"editable_individual_{filename}_{pd.Timestamp.now().strftime('%Y%m%d')}"
+                                    content = st.session_state.get(individual_key, resummarized_results[filename])
+                                    chunk_key = f"html_import_{file_idx + 1:02d}_{filename}"
+                                    st.session_state.extracted_texts[chunk_key] = content
+                            
+                            st.success(f"✅ Added {len(resummarized_results)} files to session for further editing!")
+                            st.rerun()
+                
+                else:  # Combined Content
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        # Save combined summary as text (use edited version if available)
+                        if st.button("💾 Save as Text"):
+                            # Use edited content if it exists, otherwise use original
+                            content_to_save = st.session_state.get(combined_key, resummarized_results["combined_summary"])
+                            
+                            st.download_button(
+                                "Download Text File",
+                                content_to_save,
+                                file_name=f"combined_resummarized_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                mime="text/plain"
+                            )
+                    
+                    with col2:
+                        # Save combined summary as HTML (use edited version if available)
+                        if st.button("🌐 Save as HTML"):
+                            file_list = ", ".join([f"{file_idx + 1}. {html_import_files[file_idx].name}" for file_idx in st.session_state.html_file_order])
+                            content_to_save = st.session_state.get(combined_key, resummarized_results["combined_summary"])
+                            
+                            # Check if content has been edited
+                            edited_indicator = ""
+                            if st.session_state.get(combined_key) != resummarized_results.get("combined_summary"):
+                                edited_indicator = "<br>⚠️ Content has been manually edited"
+                            
+                            html_output = f"""
+                            <!DOCTYPE html>
+                            <html>
+                            <head>
+                                <title>Combined Resummarized Content</title>
+                                <meta charset="UTF-8">
+                                <style>
+                                    body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+                                    .header {{ border-bottom: 2px solid #333; padding-bottom: 20px; margin-bottom: 30px; }}
+                                    .content {{ max-width: 800px; }}
+                                    .meta {{ color: #666; font-size: 0.9em; margin-bottom: 20px; }}
+                                </style>
+                            </head>
+                            <body>
+                                <div class="header">
+                                    <h1>Combined Resummarized Content</h1>
+                                    <div class="meta">
+                                        Original Files: {file_list}<br>
+                                        Total Files Processed: {len(extracted_contents)}<br>
+                                        Resummarized on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
+                                        Target Length: {target_length} words<br>
+                                        AI Provider: {ai_provider}<br>
+                                        Processing Mode: {processing_mode}{edited_indicator}
+                                    </div>
+                                </div>
+                                <div class="content">
+                                    <p>{content_to_save.replace(chr(10), '</p><p>')}</p>
+                                </div>
+                            </body>
+                            </html>
+                            """
+                            st.download_button(
+                                "Download HTML File",
+                                html_output,
+                                file_name=f"combined_resummarized_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.html",
+                                mime="text/html"
+                            )
+                    
+                    with col3:
+                        # Save to session state for further editing (use edited version if available)
+                        if st.button("📝 Continue Editing"):
+                            if 'extracted_texts' not in st.session_state:
+                                st.session_state.extracted_texts = {}
+                            
+                            content_to_save = st.session_state.get(combined_key, resummarized_results["combined_summary"])
+                            chunk_key = f"html_combined_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+                            st.session_state.extracted_texts[chunk_key] = content_to_save
+                            
+                            st.success("✅ Combined content (including any edits) added to session for further editing!")
+                            st.rerun()
+                    
+                    # Additional save options for edited content
+                    if st.session_state.get(combined_key) != resummarized_results.get("combined_summary"):
+                        st.markdown("---")
+                        st.markdown("#### 🔧 Additional Save Options for Edited Content")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            # Save as markdown
+                            if st.button("📝 Save as Markdown", help="Save edited content as Markdown file"):
+                                content_to_save = st.session_state.get(combined_key, "")
+                                markdown_content = f"""# Combined Resummarized Content
+
+**Source Files:** {", ".join([f"{file_idx + 1}. {html_import_files[file_idx].name}" for file_idx in st.session_state.html_file_order])}
+
+**Processing Details:**
+- Total Files Processed: {len(extracted_contents)}
+- Resummarized on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
+- Target Length: {target_length} words
+- AI Provider: {ai_provider}
+- Processing Mode: {processing_mode}
+- Status: Manually Edited ✏️
+
+---
+
+{content_to_save}
+"""
+                                st.download_button(
+                                    "Download Markdown File",
+                                    markdown_content,
+                                    file_name=f"combined_edited_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.md",
+                                    mime="text/markdown"
+                                )
+                        
+                        with col2:
+                            # Save version comparison
+                            if st.button("📊 Save Comparison", help="Save both original and edited versions"):
+                                original_content = resummarized_results.get("combined_summary", "")
+                                edited_content = st.session_state.get(combined_key, "")
+                                
+                                comparison_content = f"""COMBINED SUMMARY COMPARISON
+Generated on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{'='*60}
+ORIGINAL AI-GENERATED SUMMARY
+{'='*60}
+
+{original_content}
+
+{'='*60}
+EDITED VERSION
+{'='*60}
+
+{edited_content}
+
+{'='*60}
+METADATA
+{'='*60}
+
+Source Files: {", ".join([f"{file_idx + 1}. {html_import_files[file_idx].name}" for file_idx in st.session_state.html_file_order])}
+Total Files: {len(extracted_contents)}
+Target Length: {target_length} words
+AI Provider: {ai_provider}
+Processing Mode: {processing_mode}
+"""
+                                st.download_button(
+                                    "Download Comparison File",
+                                    comparison_content,
+                                    file_name=f"comparison_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                    mime="text/plain"
+                                )
+                        
+                        with col3:
+                            # Show editing statistics
+                            if st.button("📈 View Edit Stats", help="Show statistics about the changes made"):
+                                original = resummarized_results.get("combined_summary", "")
+                                edited = st.session_state.get(combined_key, "")
+                                
+                                orig_words = len(original.split())
+                                edit_words = len(edited.split())
+                                orig_chars = len(original)
+                                edit_chars = len(edited)
+                                
+                                st.info(f"""
+**Editing Statistics:**
+- Original: {orig_words:,} words, {orig_chars:,} characters
+- Edited: {edit_words:,} words, {edit_chars:,} characters  
+- Change: {edit_words - orig_words:+,} words, {edit_chars - orig_chars:+,} characters
+- Word change: {((edit_words - orig_words) / orig_words * 100) if orig_words > 0 else 0:.1f}%
+                                """)
+                
+            except Exception as e:
+                st.error(f"❌ Error during resummarization: {str(e)}")
+        
+    except Exception as e:
+        st.error(f"❌ Error processing HTML file: {str(e)}")
+
 if uploaded_files:
     # File ordering interface
     st.subheader("📋 File Order")
@@ -476,9 +1800,88 @@ if uploaded_files:
             process_button = st.button("🚀 Process Files with Agents", type="primary")
         with col2:
             if st.button("🗑️ Clear All Work", help="Clear all previous work and start fresh"):
-                st.session_state.current_state = {}
-                st.session_state.processing_complete = False
-                st.success("✅ All previous work cleared!")
+                # Clear all session state variables to completely reset
+                keys_to_clear = [
+                    # Main workflow state
+                    'current_state',
+                    'processing_complete',
+                    'file_order',
+                    
+                    # Agent instances (will be recreated on next run)
+                    'workflow_app',
+                    'agents', 
+                    'grammar_analyzer',
+                    'parallel_editor',
+                    'parallel_editor_ui',
+                    
+                    # TTS settings
+                    'current_tts_engine',
+                    'current_tts_settings',
+                    
+                    # Ollama timeout
+                    'current_ollama_timeout',
+                    
+                    # Grammar analyses
+                    'grammar_analyses',
+                    
+                    # Demo state (if exists)
+                    'demo_state'
+                ]
+                
+                # Clear all parallel editing sessions and related data
+                # These are dynamically generated with patterns like editing_session_{chunk_id}
+                session_keys_to_remove = []
+                for key in st.session_state.keys():
+                    if (key.startswith('editing_session_') or 
+                        key.startswith('ai_improve_request_') or
+                        key.startswith('spell_check_request_') or
+                        key.startswith('speech_request_') or
+                        key.startswith('summarize_request_') or
+                        key.startswith('export_request_') or
+                        key.startswith('show_speech_')):
+                        session_keys_to_remove.append(key)
+                
+                # Remove all identified keys
+                for key in keys_to_clear:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                
+                for key in session_keys_to_remove:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                
+                # Clear session backup files and text versions
+                try:
+                    session_file = get_session_file_path()
+                    if session_file.exists():
+                        session_file.unlink()
+                    
+                    # Clear text version history
+                    versions_dir = get_version_history_path()
+                    session_id = st.session_state.get('session_id', 'default')
+                    pattern = f"{session_id}_chunk_*.pkl"
+                    
+                    deleted_versions = 0
+                    for filepath in versions_dir.glob(pattern):
+                        try:
+                            filepath.unlink()
+                            deleted_versions += 1
+                        except:
+                            pass
+                    
+                    if deleted_versions > 0:
+                        st.info(f"🗑️ Also cleared {deleted_versions} text version(s)")
+                        
+                except:
+                    pass  # Silently ignore backup deletion errors
+                
+                # Reset recovery flags
+                if 'recovery_offered' in st.session_state:
+                    del st.session_state['recovery_offered']
+                if 'recovery_handled' in st.session_state:
+                    del st.session_state['recovery_handled']
+                
+                st.success("✅ All previous work and session data completely cleared!")
                 st.rerun()
     else:
         process_button = st.button("🚀 Process Files with Agents", type="primary")
@@ -712,6 +2115,14 @@ if uploaded_files:
                         st.info("✅ Session state reinitialized with current workflow result")
                 
                 st.session_state.processing_complete = True
+                
+                # Save original text versions for each chunk
+                if result.get("processed_chunks"):
+                    for i, chunk in enumerate(result["processed_chunks"]):
+                        save_text_version(i, chunk["current_text"], "original")
+                
+                # Auto-save after successful processing
+                auto_save_session()
                 st.success("✅ All agents completed processing successfully!")
                 
             except Exception as e:
@@ -757,8 +2168,33 @@ if uploaded_files:
 if st.session_state.processing_complete and st.session_state.current_state:
     current_state = st.session_state.current_state
     
+    # Auto-save the session when results are displayed
+    auto_save_session()
+    
     # Show processing results
     st.header("🤖 Agent Processing Results")
+    
+    # Add manual save controls
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col2:
+        if st.button("💾 Save Session", help="Manually save current session to prevent data loss"):
+            if save_session_backup():
+                st.success("✅ Session saved!")
+            else:
+                st.error("❌ Save failed")
+    
+    with col3:
+        # Show last auto-save time
+        session_file = get_session_file_path()
+        if session_file.exists():
+            try:
+                save_time = session_file.stat().st_mtime
+                from datetime import datetime
+                save_date = datetime.fromtimestamp(save_time).strftime('%H:%M:%S')
+                st.caption(f"💾 Last saved: {save_date}")
+            except:
+                pass
     
     # Display extracted texts
     if current_state.get("extracted_texts"):
@@ -772,7 +2208,7 @@ if st.session_state.processing_complete and st.session_state.current_state:
         st.subheader("📝 Enhanced Text Processing & Grammar Analysis")
         
         # Create tabs for different functionalities
-        tab1, tab2, tab3, tab4 = st.tabs(["🔧 Basic Processing", "📝 Parallel Editor", "📊 Grammar Analysis", "🎵 Text-to-Speech"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔧 Basic Processing", "📝 Parallel Editor", "📊 Grammar Analysis", "🎵 Text-to-Speech", "📚 Text History"])
         
         with tab1:
             st.markdown("### Basic Text Processing Controls")
@@ -797,13 +2233,19 @@ if st.session_state.processing_complete and st.session_state.current_state:
                                 text_processor = st.session_state.agents["text_processor"]
                                 for i in range(len(current_state["processed_chunks"])):
                                     result_state = text_processor.process_chunk_spell_check(
-                                        current_state, i, openai_api_key, actual_spell_check_ai, ollama_url, ollama_model
+                                        current_state, i, openai_api_key, actual_spell_check_ai, ollama_url, ollama_model, ollama_timeout
                                     )
                                     if result_state.get("error_message"):
                                         st.error(f"Spell check failed for chunk {i+1}: {result_state['error_message']}")
                                         break  # Stop on error to avoid wasting more requests
                                     else:
                                         current_state = result_state
+                                
+                                # Save spell check versions
+                                for i, chunk in enumerate(current_state.get("processed_chunks", [])):
+                                    if chunk.get("spell_checked"):
+                                        save_text_version(i, chunk["current_text"], "spell_check")
+                                
                                 st.session_state.current_state = current_state
                                 st.success("✅ Spell check agent completed for all chunks!")
                                 st.rerun()
@@ -1022,6 +2464,8 @@ if st.session_state.processing_complete and st.session_state.current_state:
                                 result_state = human_editor.approve_parallel_edits(current_state, editing_session)
                                 if not result_state.get("error_message"):
                                     st.session_state.current_state = result_state
+                                    # Auto-save after parallel edits
+                                    auto_save_session()
                                     st.success("✅ Parallel edits approved and applied!")
                                     st.rerun()
                                 else:
@@ -1184,6 +2628,8 @@ if st.session_state.processing_complete and st.session_state.current_state:
                                     st.error(result_state["error_message"])
                                 else:
                                     st.session_state.current_state = result_state
+                                    # Auto-save after TTS completion
+                                    auto_save_session()
                                     st.success("✅ TTS agent completed for all chunks!")
                                     st.rerun()
                     else:
@@ -1263,6 +2709,270 @@ if st.session_state.processing_complete and st.session_state.current_state:
                                         st.session_state.current_state = result_state
                                         st.success(f"✅ TTS agent completed for chunk {i+1}!")
                                         st.rerun()
+        
+        with tab5:
+            st.markdown("### 📚 Text Version History")
+            st.markdown("Browse and restore previous versions of your text from this session.")
+            
+            # Get all saved versions for current session
+            all_versions = get_all_session_versions()
+            
+            if not all_versions:
+                st.info("📝 No previous text versions found. Versions are automatically saved as you edit text in the Parallel Editor.")
+                st.markdown("**Version types saved:**")
+                st.markdown("- 🔤 **Original**: Initial extracted text")
+                st.markdown("- ✏️ **Edit**: Manual text edits")
+                st.markdown("- 📝 **Spell Check**: After spell check corrections")
+                st.markdown("- 🤖 **AI Improve**: After AI text improvements")
+                st.markdown("- 📋 **Summary**: Generated summaries")
+            else:
+                # Show version statistics
+                total_versions = sum(len(versions) for versions in all_versions.values())
+                st.info(f"📊 Found {total_versions} saved text versions across {len(all_versions)} chunks")
+                
+                # Chunk selector
+                chunk_options = []
+                for chunk_id in sorted(all_versions.keys()):
+                    version_count = len(all_versions[chunk_id])
+                    chunk_options.append(f"Chunk {chunk_id + 1} ({version_count} versions)")
+                
+                selected_chunk_display = st.selectbox(
+                    "Select chunk to view history:",
+                    options=chunk_options,
+                    help="Choose which text chunk's version history to browse"
+                )
+                
+                # Extract chunk ID from selection
+                selected_chunk_id = int(selected_chunk_display.split()[1]) - 1
+                chunk_versions = all_versions[selected_chunk_id]
+                
+                st.markdown(f"### 📜 Version History for Chunk {selected_chunk_id + 1}")
+                
+                # Show versions in a nice format
+                for i, version in enumerate(chunk_versions):
+                    from datetime import datetime
+                    version_time = datetime.fromtimestamp(version['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    # Version type icon mapping
+                    type_icons = {
+                        'original': '🔤',
+                        'edit': '✏️',
+                        'spell_check': '📝',
+                        'ai_improve': '🤖',
+                        'summary': '📋'
+                    }
+                    
+                    version_icon = type_icons.get(version['version_type'], '📄')
+                    version_type_display = version['version_type'].replace('_', ' ').title()
+                    
+                    with st.expander(f"{version_icon} {version_type_display} - {version_time} ({version['word_count']} words)"):
+                        col1, col2 = st.columns([3, 1])
+                        
+                        with col1:
+                            # Show version info
+                            st.caption(f"**Created:** {version_time}")
+                            st.caption(f"**Type:** {version_type_display}")
+                            st.caption(f"**Words:** {version['word_count']} | **Characters:** {version['char_count']}")
+                            
+                            # Show text preview (first 300 characters)
+                            preview_text = version['text'][:300]
+                            if len(version['text']) > 300:
+                                preview_text += "..."
+                            st.text_area(
+                                "Text Preview:",
+                                value=preview_text,
+                                height=150,
+                                disabled=True,
+                                key=f"preview_{selected_chunk_id}_{i}"
+                            )
+                            
+                            # Full text expander
+                            with st.expander("📄 View Full Text"):
+                                st.text_area(
+                                    "Full Text:",
+                                    value=version['text'],
+                                    height=300,
+                                    disabled=True,
+                                    key=f"full_{selected_chunk_id}_{i}"
+                                )
+                        
+                        with col2:
+                            st.markdown("**Actions:**")
+                            
+                            # Copy to clipboard (download as text file)
+                            timestamp_str = str(int(version['timestamp']))
+                            filename = f"text_version_{selected_chunk_id}_{version['version_type']}_{timestamp_str}.txt"
+                            
+                            st.download_button(
+                                "💾 Download",
+                                data=version['text'],
+                                file_name=filename,
+                                mime="text/plain",
+                                key=f"download_{selected_chunk_id}_{i}",
+                                help="Download this version as a text file"
+                            )
+                            
+                            # Restore this version (only for current chunks)
+                            if selected_chunk_id < len(current_state.get("processed_chunks", [])):
+                                if st.button(
+                                    "🔄 Restore",
+                                    key=f"restore_{selected_chunk_id}_{i}",
+                                    help="Replace current text with this version"
+                                ):
+                                    # Update the current chunk with this version
+                                    try:
+                                        # Create backup of current version first
+                                        current_chunk = current_state["processed_chunks"][selected_chunk_id]
+                                        save_text_version(selected_chunk_id, current_chunk["current_text"], "backup_before_restore")
+                                        
+                                        # Update the chunk text
+                                        current_state["processed_chunks"][selected_chunk_id]["current_text"] = version['text']
+                                        st.session_state.current_state = current_state
+                                        
+                                        # Save the restored version
+                                        save_text_version(selected_chunk_id, version['text'], "restored")
+                                        
+                                        # Auto-save session
+                                        auto_save_session()
+                                        
+                                        st.success(f"✅ Text restored from {version_type_display} version!")
+                                        st.info("💡 A backup of the previous text was saved before restoration.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"❌ Failed to restore version: {str(e)}")
+                            else:
+                                st.caption("⚠️ Chunk no longer exists")
+                            
+                            # Compare with current version
+                            if (selected_chunk_id < len(current_state.get("processed_chunks", [])) and 
+                                st.button("📊 Compare", key=f"compare_{selected_chunk_id}_{i}", help="Compare with current version")):
+                                
+                                current_text = current_state["processed_chunks"][selected_chunk_id]["current_text"]
+                                
+                                st.markdown("### 📊 Text Comparison")
+                                
+                                comp_col1, comp_col2 = st.columns(2)
+                                
+                                with comp_col1:
+                                    st.markdown("**📄 Saved Version**")
+                                    st.text_area(
+                                        "Saved Version",
+                                        value=version['text'],
+                                        height=200,
+                                        disabled=True,
+                                        key=f"comp_saved_{selected_chunk_id}_{i}",
+                                        label_visibility="collapsed"
+                                    )
+                                    st.caption(f"Words: {version['word_count']}, Chars: {version['char_count']}")
+                                
+                                with comp_col2:
+                                    st.markdown("**📝 Current Version**")
+                                    current_words = len(current_text.split())
+                                    current_chars = len(current_text)
+                                    st.text_area(
+                                        "Current Version",
+                                        value=current_text,
+                                        height=200,
+                                        disabled=True,
+                                        key=f"comp_current_{selected_chunk_id}_{i}",
+                                        label_visibility="collapsed"
+                                    )
+                                    st.caption(f"Words: {current_words}, Chars: {current_chars}")
+                                
+                                # Show differences
+                                word_diff = current_words - version['word_count']
+                                char_diff = current_chars - version['char_count']
+                                
+                                if word_diff == 0 and char_diff == 0:
+                                    st.success("✅ Versions are identical")
+                                else:
+                                    diff_color = "🔴" if word_diff < 0 else "🟢" if word_diff > 0 else "🟡"
+                                    st.info(f"{diff_color} Difference: {word_diff:+d} words, {char_diff:+d} characters")
+                
+                # Bulk actions
+                st.markdown("### 🔧 Bulk Actions")
+                bulk_col1, bulk_col2, bulk_col3 = st.columns(3)
+                
+                with bulk_col1:
+                    if st.button("🗑️ Clear History", key=f"clear_history_{selected_chunk_id}"):
+                        try:
+                            versions_dir = get_version_history_path()
+                            session_id = st.session_state.get('session_id', 'default')
+                            pattern = f"{session_id}_chunk_{selected_chunk_id}_*.pkl"
+                            
+                            deleted_count = 0
+                            for filepath in versions_dir.glob(pattern):
+                                try:
+                                    filepath.unlink()
+                                    deleted_count += 1
+                                except:
+                                    pass
+                            
+                            if deleted_count > 0:
+                                st.success(f"✅ Deleted {deleted_count} version(s)")
+                                st.rerun()
+                            else:
+                                st.warning("No versions found to delete")
+                        except Exception as e:
+                            st.error(f"❌ Failed to clear history: {str(e)}")
+                
+                with bulk_col2:
+                    # Export all versions of this chunk
+                    if st.button("📦 Export All", key=f"export_all_{selected_chunk_id}"):
+                        try:
+                            import zipfile
+                            import io
+                            
+                            # Create a zip file in memory
+                            zip_buffer = io.BytesIO()
+                            
+                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                                for j, ver in enumerate(chunk_versions):
+                                    ver_time = datetime.fromtimestamp(ver['timestamp']).strftime('%Y%m%d_%H%M%S')
+                                    ver_filename = f"chunk_{selected_chunk_id}_{ver['version_type']}_{ver_time}.txt"
+                                    zip_file.writestr(ver_filename, ver['text'])
+                            
+                            zip_buffer.seek(0)
+                            
+                            zip_filename = f"chunk_{selected_chunk_id}_all_versions.zip"
+                            st.download_button(
+                                "📥 Download ZIP",
+                                data=zip_buffer.getvalue(),
+                                file_name=zip_filename,
+                                mime="application/zip",
+                                key=f"download_zip_{selected_chunk_id}"
+                            )
+                        except Exception as e:
+                            st.error(f"❌ Failed to create export: {str(e)}")
+                
+                with bulk_col3:
+                    if st.button("📊 Statistics", key=f"stats_{selected_chunk_id}"):
+                        st.markdown("### 📈 Version Statistics")
+                        
+                        # Calculate statistics
+                        word_counts = [v['word_count'] for v in chunk_versions]
+                        char_counts = [v['char_count'] for v in chunk_versions]
+                        version_types = [v['version_type'] for v in chunk_versions]
+                        
+                        stat_col1, stat_col2 = st.columns(2)
+                        
+                        with stat_col1:
+                            st.metric("Total Versions", len(chunk_versions))
+                            st.metric("Avg Words", f"{sum(word_counts) / len(word_counts):.0f}")
+                            st.metric("Max Words", max(word_counts))
+                        
+                        with stat_col2:
+                            st.metric("Avg Characters", f"{sum(char_counts) / len(char_counts):.0f}")
+                            st.metric("Max Characters", max(char_counts))
+                            
+                            # Version type breakdown
+                            type_counts = {}
+                            for vtype in version_types:
+                                type_counts[vtype] = type_counts.get(vtype, 0) + 1
+                            
+                            st.markdown("**Version Types:**")
+                            for vtype, count in type_counts.items():
+                                st.caption(f"{vtype.replace('_', ' ').title()}: {count}")
                 
                 st.markdown("---")
 

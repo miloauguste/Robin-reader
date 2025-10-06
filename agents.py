@@ -669,7 +669,7 @@ Please complete or repair this sentence to make it grammatically correct and com
                     model=ollama_model,
                     prompt=user_prompt,
                     system_prompt=system_prompt,
-                    timeout=90,  # 1.5 minutes timeout for spell checking
+                    timeout=timeout,  # Use configurable timeout
                     temperature=0.3,
                     max_tokens=500
                 )
@@ -791,7 +791,7 @@ class TextProcessingAgent:
         return chunks
     
     def spell_check_with_ai(self, text: str, api_key: str = None, ai_provider: str = "OpenAI", 
-                          ollama_url: str = None, ollama_model: str = None) -> str:
+                          ollama_url: str = None, ollama_model: str = None, timeout: int = 90) -> str:
         """Check and correct spelling using AI (OpenAI or Ollama) with rate limiting"""
         try:
             # Check rate limit for OpenAI only
@@ -880,7 +880,7 @@ class TextProcessingAgent:
             raise Exception(f"Grammar check error: {str(e)}")
     
     def improve_text_with_ai(self, text: str, api_key: str = None, improvement_type: str = "general", 
-                           ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> str:
+                           ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None, timeout: int = 120) -> str:
         """Improve text using AI (OpenAI or Ollama) with specific improvement types"""
         try:
             # Check rate limit for OpenAI only
@@ -934,7 +934,7 @@ class TextProcessingAgent:
                     model=ollama_model,
                     prompt=text,
                     system_prompt=system_prompt + " Return only the improved text without explanations or additional commentary.",
-                    timeout=120,  # 2 minutes timeout for text improvement
+                    timeout=timeout,  # Use configurable timeout
                     temperature=0.4
                 )
                 return result
@@ -944,8 +944,8 @@ class TextProcessingAgent:
         except Exception as e:
             raise Exception(f"Text improvement error: {str(e)}")
     
-    def summarize_text_with_ai(self, text: str, api_key: str = None, target_length: int = 250,
-                             ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> str:
+    def summarize_text_with_ai(self, text: str, api_key: str = None, target_length: int = 350,
+                             ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None, timeout: int = 180) -> str:
         """Summarize text using AI (OpenAI or Ollama) with specific line references and target word count"""
         try:
             # Check rate limit for OpenAI only
@@ -978,7 +978,13 @@ class TextProcessingAgent:
 5. Provides context and analysis, not just a list of points
 6. Uses clear, engaging prose suitable for someone who hasn't read the original text
 
-Format your summary as flowing paragraphs with embedded line references. Make it comprehensive and detailed while remaining readable."""
+CRITICAL FORMATTING REQUIREMENT: Your entire response must be written in well-structured paragraph form only. Do NOT use:
+- Bullet points or numbered lists
+- Headers or subheadings
+- Dashes or other list-style formatting
+- Line breaks that create artificial separation between related ideas
+
+Write your summary as continuous, flowing paragraphs with smooth transitions between ideas. Each paragraph should focus on related themes and naturally lead to the next. Use embedded line references within the paragraph text."""
             
             user_prompt = f"Please create a detailed summary of the following text with line references:\n\n{numbered_text}"
             
@@ -1009,7 +1015,7 @@ Format your summary as flowing paragraphs with embedded line references. Make it
                     model=ollama_model,
                     prompt=user_prompt,
                     system_prompt=system_prompt,
-                    timeout=180,  # 3 minutes timeout for summarization
+                    timeout=timeout,  # Use configurable timeout
                     temperature=0.3
                 )
                 return result
@@ -1024,7 +1030,7 @@ Format your summary as flowing paragraphs with embedded line references. Make it
         """Backward compatibility wrapper for OpenAI text improvement"""
         return self.improve_text_with_ai(text, api_key, improvement_type, "OpenAI")
     
-    def summarize_text_openai(self, text: str, api_key: str, target_length: int = 250) -> str:
+    def summarize_text_openai(self, text: str, api_key: str, target_length: int = 350) -> str:
         """Backward compatibility wrapper for OpenAI text summarization"""
         return self.summarize_text_with_ai(text, api_key, target_length, "OpenAI")
     
@@ -1115,7 +1121,7 @@ Format your summary as flowing paragraphs with embedded line references. Make it
             }
     
     def process_chunk_spell_check(self, state: TextReaderState, chunk_id: int, api_key: str = None,
-                                ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> TextReaderState:
+                                ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None, timeout: int = 90) -> TextReaderState:
         """Perform spell check on a specific chunk using specified AI provider"""
         try:
             # Use provided api_key or fall back to state api_key
@@ -1135,7 +1141,7 @@ Format your summary as flowing paragraphs with embedded line references. Make it
             chunk = processed_chunks[chunk_id]
             original_text = chunk["current_text"]
             
-            corrected_text = self.spell_check_with_ai(original_text, api_key, ai_provider, ollama_url, ollama_model)
+            corrected_text = self.spell_check_with_ai(original_text, api_key, ai_provider, ollama_url, ollama_model, timeout)
             
             # Update the chunk
             processed_chunks[chunk_id]["current_text"] = corrected_text
@@ -1522,7 +1528,7 @@ class ParallelEditingWindowAgent:
                 "error": f"Text improvement failed: {str(e)}"
             }
     
-    def summarize_text_with_openai(self, editing_session: Dict[str, Any], api_key: str, target_length: int = 250) -> Dict[str, Any]:
+    def summarize_text_with_openai(self, editing_session: Dict[str, Any], api_key: str, target_length: int = 350) -> Dict[str, Any]:
         """Summarize text using OpenAI with specific line references"""
         try:
             if not api_key:
@@ -1559,8 +1565,8 @@ class ParallelEditingWindowAgent:
                 "error": f"Text summarization failed: {str(e)}"
             }
     
-    def summarize_text_with_ai(self, editing_session: Dict[str, Any], api_key: str = None, target_length: int = 250,
-                             ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None) -> Dict[str, Any]:
+    def summarize_text_with_ai(self, editing_session: Dict[str, Any], api_key: str = None, target_length: int = 350,
+                             ai_provider: str = "OpenAI", ollama_url: str = None, ollama_model: str = None, timeout: int = 180) -> Dict[str, Any]:
         """Summarize text using AI (OpenAI or Ollama) with specific line references"""
         try:
             current_text = editing_session["parallel_text"]
@@ -1568,7 +1574,7 @@ class ParallelEditingWindowAgent:
             
             # Use the new summarize_text_with_ai method from TextProcessingAgent
             summary_text = text_processor.summarize_text_with_ai(
-                current_text, api_key, target_length, ai_provider, ollama_url, ollama_model
+                current_text, api_key, target_length, ai_provider, ollama_url, ollama_model, timeout
             )
             
             # Store the summary in the editing session
@@ -1602,7 +1608,7 @@ class ParallelEditingWindowAgent:
     def generate_speech_and_summary(self, editing_session: Dict[str, Any], api_key: str, 
                                    tts_engine: str = "Google TTS", tts_settings: Dict[str, Any] = None,
                                    include_speech: bool = True, include_summary: bool = True,
-                                   summary_length: int = 250, base_filename: str = None,
+                                   summary_length: int = 350, base_filename: str = None,
                                    summarization_ai: str = "OpenAI", ollama_url: str = None, 
                                    ollama_model: str = None) -> Dict[str, Any]:
         """Generate speech and/or summary content and create HTML export"""
@@ -1672,8 +1678,10 @@ class ParallelEditingWindowAgent:
                     raise Exception("Ollama URL and model required for text summarization with Ollama")
                 
                 text_processor = TextProcessingAgent()
+                # Use timeout for summarization, default to 180 seconds if not provided 
+                summary_timeout = getattr(st.session_state, 'current_ollama_timeout', 180) if summarization_ai == "Ollama" else 180
                 summary_text = text_processor.summarize_text_with_ai(
-                    current_text, api_key, summary_length, summarization_ai, ollama_url, ollama_model
+                    current_text, api_key, summary_length, summarization_ai, ollama_url, ollama_model, summary_timeout
                 )
                 result_data["summary_text"] = summary_text
                 

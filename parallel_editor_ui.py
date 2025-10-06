@@ -87,6 +87,20 @@ class ParallelEditorUI:
                             # Update the session state with the improved text
                             st.session_state[session_key] = result["updated_session"]
                             editing_session = result["updated_session"]  # Update local variable
+                            
+                            # Save AI improvement version
+                            try:
+                                improved_text = result["updated_session"]["parallel_text"]
+                                if 'text_versions_to_save' not in st.session_state:
+                                    st.session_state.text_versions_to_save = []
+                                st.session_state.text_versions_to_save.append({
+                                    'chunk_id': chunk_id,
+                                    'text': improved_text,
+                                    'version_type': 'ai_improve'
+                                })
+                            except:
+                                pass
+                            
                             st.success(f"✅ Text improved using {improvement_type.title()} style!")
                         else:
                             st.error(f"❌ Text improvement failed: {result['error']}")
@@ -101,6 +115,80 @@ class ParallelEditorUI:
             
             # Clear the request
             del st.session_state[ai_improve_key]
+        
+        # Check for pending spell check request
+        spell_check_key = f"spell_check_request_{chunk_id}"
+        if spell_check_key in st.session_state:
+            spell_check_request = st.session_state[spell_check_key]
+            
+            with st.spinner("📝 Running spell check on text..."):
+                try:
+                    # Get the current parallel text to spell check
+                    current_text = editing_session["parallel_text"]
+                    
+                    # Import the text processor agent to use its spell check functionality
+                    if hasattr(st.session_state, 'agents') and 'text_processor' in st.session_state.agents:
+                        text_processor = st.session_state.agents['text_processor']
+                        
+                        # Create a temporary chunk for spell checking
+                        temp_chunk = {
+                            "current_text": current_text,
+                            "spell_checked": False
+                        }
+                        
+                        # Create a temporary state for the spell check operation
+                        temp_state = {
+                            "processed_chunks": [temp_chunk]
+                        }
+                        
+                        # Run spell check using the same logic as the main app
+                        # Use the AI provider settings from the main session
+                        ai_provider = getattr(st.session_state, 'current_ai_provider', 'OpenAI')
+                        spell_check_ai = getattr(st.session_state, 'current_spell_check_ai', ai_provider)
+                        ollama_url = getattr(st.session_state, 'current_ollama_url', 'http://localhost:11434')
+                        ollama_model = getattr(st.session_state, 'current_ollama_model', 'llama2')
+                        ollama_timeout = getattr(st.session_state, 'current_ollama_timeout', 90)
+                        
+                        result_state = text_processor.process_chunk_spell_check(
+                            temp_state, 0, api_key, spell_check_ai, ollama_url, ollama_model, ollama_timeout
+                        )
+                        
+                        if not result_state.get("error_message"):
+                            # Extract the spell-checked text
+                            spell_checked_text = result_state["processed_chunks"][0]["current_text"]
+                            
+                            # Update the parallel editing session with the spell-checked text
+                            result = self.parallel_editor.update_parallel_text(editing_session, spell_checked_text)
+                            if result["success"]:
+                                # Update the session state with the spell-checked text
+                                session_key = f"editing_session_{chunk_id}"
+                                updated_session = result["updated_session"]
+                                
+                                # Mark that spell check was applied
+                                updated_session["last_spell_check"] = {
+                                    "applied_at": datetime.now().isoformat(),
+                                    "changes_made": spell_checked_text != current_text
+                                }
+                                
+                                st.session_state[session_key] = updated_session
+                                editing_session = updated_session  # Update local variable
+                                
+                                if spell_checked_text != current_text:
+                                    st.success("✅ Spell check completed - corrections applied!")
+                                else:
+                                    st.success("✅ Spell check completed - no corrections needed!")
+                            else:
+                                st.error(f"Failed to apply spell check: {result['error']}")
+                        else:
+                            st.error(f"Spell check failed: {result_state['error_message']}")
+                    else:
+                        st.error("❌ Text processor agent not available for spell check")
+                        
+                except Exception as e:
+                    st.error(f"❌ Spell check error: {str(e)}")
+            
+            # Clear the request
+            del st.session_state[spell_check_key]
         
         # Check for pending speech generation request
         speech_request_key = f"speech_request_{chunk_id}"
@@ -171,18 +259,32 @@ class ParallelEditorUI:
                         st.error("❌ No text to summarize")
                     elif (summarization_ai or ai_provider) == "OpenAI" and not api_key:
                         st.error("❌ OpenAI API key required for text summarization")
-                    elif (summarization_ai or ai_provider) == "Ollama" and (not ollama_url or not ollama_model):
-                        st.error("❌ Ollama URL and model required for text summarization")
                     else:
                         # Use the parallel editor agent to summarize with selected AI provider
                         actual_ai_provider = summarization_ai or ai_provider
+                        
+                        # Get Ollama settings - use parameters first, fallback to session state
+                        actual_ollama_url = ollama_url or getattr(st.session_state, 'current_ollama_url', None)
+                        actual_ollama_model = ollama_model or getattr(st.session_state, 'current_ollama_model', None)
+                        actual_ollama_timeout = getattr(st.session_state, 'current_ollama_timeout', 180)
+                        
+                        # Check if we have required settings for Ollama after fallback
+                        if actual_ai_provider == "Ollama" and (not actual_ollama_url or not actual_ollama_model):
+                            st.error(f"❌ Ollama URL and model required for text summarization. URL: {actual_ollama_url}, Model: {actual_ollama_model}")
+                            return None
+                        
+                        # Debug: Show what we're using for Ollama
+                        if actual_ai_provider == "Ollama":
+                            st.info(f"🔧 Debug: Using Ollama URL: {actual_ollama_url}, Model: {actual_ollama_model}")
+                        
                         result = self.parallel_editor.summarize_text_with_ai(
                             editing_session, 
                             api_key, 
-                            target_length=250,
+                            target_length=350,
                             ai_provider=actual_ai_provider,
-                            ollama_url=ollama_url,
-                            ollama_model=ollama_model
+                            ollama_url=actual_ollama_url,
+                            ollama_model=actual_ollama_model,
+                            timeout=actual_ollama_timeout
                         )
                         
                         if result["success"]:
@@ -190,6 +292,19 @@ class ParallelEditorUI:
                             session_key = f"editing_session_{chunk_id}"
                             st.session_state[session_key] = result["updated_session"]
                             editing_session = result["updated_session"]  # Update local variable
+                            
+                            # Save summary version
+                            try:
+                                summary_text = result["summary_text"]
+                                if 'text_versions_to_save' not in st.session_state:
+                                    st.session_state.text_versions_to_save = []
+                                st.session_state.text_versions_to_save.append({
+                                    'chunk_id': chunk_id,
+                                    'text': summary_text,
+                                    'version_type': 'summary'
+                                })
+                            except:
+                                pass
                             
                             st.success("📋 Summary generated successfully!")
                             
@@ -257,107 +372,120 @@ class ParallelEditorUI:
                         # Determine actual summarization AI provider
                         actual_summarization_ai = summarization_ai or ai_provider
                         
-                        # Use the parallel editor agent to generate combined export
-                        result = self.parallel_editor.generate_speech_and_summary(
-                            editing_session, 
-                            api_key,
-                            tts_engine=tts_engine,
-                            tts_settings=tts_settings,
-                            include_speech=include_speech,
-                            include_summary=include_summary,
-                            summary_length=summary_length,
-                            base_filename=base_filename,
-                            summarization_ai=actual_summarization_ai,
-                            ollama_url=ollama_url,
-                            ollama_model=ollama_model
-                        )
+                        # Get Ollama settings - use parameters first, fallback to session state
+                        actual_ollama_url = ollama_url or getattr(st.session_state, 'current_ollama_url', None)
+                        actual_ollama_model = ollama_model or getattr(st.session_state, 'current_ollama_model', None)
+                        actual_ollama_timeout = getattr(st.session_state, 'current_ollama_timeout', 180)
                         
-                        if result["success"]:
-                            # Update the session state
-                            session_key = f"editing_session_{chunk_id}"
-                            st.session_state[session_key] = result["updated_session"]
-                            editing_session = result["updated_session"]  # Update local variable
+                        # Check if we have required settings for Ollama after fallback
+                        if actual_summarization_ai == "Ollama" and include_summary and (not actual_ollama_url or not actual_ollama_model):
+                            st.error(f"❌ Ollama URL and model required for text summarization. URL: {actual_ollama_url}, Model: {actual_ollama_model}")
+                        else:
+                            # Debug: Show what we're using for Ollama
+                            if actual_summarization_ai == "Ollama":
+                                st.info(f"🔧 Debug: Using Ollama URL: {actual_ollama_url}, Model: {actual_ollama_model}")
                             
-                            export_data = result["export_data"]
+                            # Use the parallel editor agent to generate combined export
+                            result = self.parallel_editor.generate_speech_and_summary(
+                                editing_session, 
+                                api_key,
+                                tts_engine=tts_engine,
+                                tts_settings=tts_settings,
+                                include_speech=include_speech,
+                                include_summary=include_summary,
+                                summary_length=summary_length,
+                                base_filename=base_filename,
+                                summarization_ai=actual_summarization_ai,
+                                ollama_url=actual_ollama_url,
+                                ollama_model=actual_ollama_model
+                            )
                             
-                            st.success(f"🚀 {export_type.title().replace('_', ' ')} export completed!")
-                            
-                            # Display results in an expandable section
-                            with st.expander("🚀 Export Results", expanded=True):
-                                col1, col2 = st.columns(2)
+                            if result["success"]:
+                                # Update the session state
+                                session_key = f"editing_session_{chunk_id}"
+                                st.session_state[session_key] = result["updated_session"]
+                                editing_session = result["updated_session"]  # Update local variable
                                 
-                                with col1:
-                                    st.markdown("### 📊 Export Summary")
-                                    st.info(f"**Type:** {export_type.title().replace('_', ' ')}")
-                                    st.info(f"**Text:** {len(text_to_process)} chars, {len(text_to_process.split())} words")
-                                    
-                                    if export_data["audio_data"]:
-                                        audio_info = export_data["audio_info"]
-                                        st.info(f"**Speech:** {audio_info['engine']}")
-                                        duration_est = audio_info['word_count'] / 150
-                                        st.info(f"**Duration:** ~{duration_est:.1f} minutes")
-                                    
-                                    if export_data["summary_text"]:
-                                        summary_words = len(export_data["summary_text"].split())
-                                        st.info(f"**Summary:** {summary_words} words")
+                                export_data = result["export_data"]
                                 
-                                with col2:
-                                    st.markdown("### 💾 Download Options")
+                                st.success(f"🚀 {export_type.title().replace('_', ' ')} export completed!")
+                                
+                                # Display results in an expandable section
+                                with st.expander("🚀 Export Results", expanded=True):
+                                    col1, col2 = st.columns(2)
+                                
+                                    with col1:
+                                        st.markdown("### 📊 Export Summary")
+                                        st.info(f"**Type:** {export_type.title().replace('_', ' ')}")
+                                        st.info(f"**Text:** {len(text_to_process)} chars, {len(text_to_process.split())} words")
                                     
-                                    # Generate timestamp for fallback filenames
-                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                        if export_data["audio_data"]:
+                                            audio_info = export_data["audio_info"]
+                                            st.info(f"**Speech:** {audio_info['engine']}")
+                                            duration_est = audio_info['word_count'] / 150
+                                            st.info(f"**Duration:** ~{duration_est:.1f} minutes")
+                                        
+                                        if export_data["summary_text"]:
+                                            summary_words = len(export_data["summary_text"].split())
+                                            st.info(f"**Summary:** {summary_words} words")
                                     
-                                    # HTML download button (always available)
-                                    html_content = export_data["html_content"]
-                                    base_filename = export_data.get("base_filename")
-                                    if base_filename:
-                                        html_filename = f"{base_filename}.html"
-                                    else:
-                                        html_filename = f"text_export_chunk_{chunk_id}_{timestamp}.html"
-                                    
-                                    st.download_button(
-                                        "📄 Download HTML Export",
-                                        data=html_content,
-                                        file_name=html_filename,
-                                        mime="text/html",
-                                        key=f"download_html_{chunk_id}",
-                                        help="Complete HTML file with embedded audio and content"
-                                    )
-                                    
-                                    # Individual download options
-                                    if export_data["audio_data"]:
+                                    with col2:
+                                        st.markdown("### 💾 Download Options")
+                                        
+                                        # Generate timestamp for fallback filenames
+                                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                        
+                                        # HTML download button (always available)
+                                        html_content = export_data["html_content"]
+                                        base_filename = export_data.get("base_filename")
                                         if base_filename:
-                                            audio_filename = f"{base_filename}.wav"
+                                            html_filename = f"{base_filename}.html"
                                         else:
-                                            audio_filename = f"speech_chunk_{chunk_id}_{timestamp}.mp3"
+                                            html_filename = f"text_export_chunk_{chunk_id}_{timestamp}.html"
                                         
                                         st.download_button(
-                                            "🎵 Download Audio Only",
-                                            data=export_data["audio_data"],
-                                            file_name=audio_filename,
-                                            mime="audio/wav" if base_filename else "audio/mp3",
-                                            key=f"download_audio_only_{chunk_id}"
+                                            "📄 Download HTML Export",
+                                            data=html_content,
+                                            file_name=html_filename,
+                                            mime="text/html",
+                                            key=f"download_html_{chunk_id}",
+                                            help="Complete HTML file with embedded audio and content"
                                         )
+                                        
+                                        # Individual download options
+                                        if export_data["audio_data"]:
+                                            if base_filename:
+                                                audio_filename = f"{base_filename}.wav"
+                                            else:
+                                                audio_filename = f"speech_chunk_{chunk_id}_{timestamp}.mp3"
+                                            
+                                            st.download_button(
+                                                "🎵 Download Audio Only",
+                                                data=export_data["audio_data"],
+                                                file_name=audio_filename,
+                                                mime="audio/wav" if base_filename else "audio/mp3",
+                                                key=f"download_audio_only_{chunk_id}"
+                                            )
+                                        
+                                        if export_data["summary_text"]:
+                                            st.download_button(
+                                                "📋 Download Summary Only",
+                                                data=export_data["summary_text"],
+                                                file_name=f"summary_chunk_{chunk_id}_{timestamp}.txt",
+                                                mime="text/plain",
+                                                key=f"download_summary_only_{chunk_id}"
+                                            )
+                                    
+                                    # Preview sections
+                                    if export_data["audio_data"]:
+                                        st.markdown("### 🎵 Audio Preview")
+                                        st.audio(export_data["audio_data"], format="audio/mp3")
                                     
                                     if export_data["summary_text"]:
-                                        st.download_button(
-                                            "📋 Download Summary Only",
-                                            data=export_data["summary_text"],
-                                            file_name=f"summary_chunk_{chunk_id}_{timestamp}.txt",
-                                            mime="text/plain",
-                                            key=f"download_summary_only_{chunk_id}"
-                                        )
-                                
-                                # Preview sections
-                                if export_data["audio_data"]:
-                                    st.markdown("### 🎵 Audio Preview")
-                                    st.audio(export_data["audio_data"], format="audio/mp3")
-                                
-                                if export_data["summary_text"]:
-                                    st.markdown("### 📋 Summary Preview")
-                                    st.markdown(export_data["summary_text"])
-                        else:
-                            st.error(f"❌ Export failed: {result['error']}")
+                                        st.markdown("### 📋 Summary Preview")
+                                        st.markdown(export_data["summary_text"])
+                            else:
+                                st.error(f"❌ Export failed: {result['error']}")
                 
                 except Exception as e:
                     st.error(f"❌ Export error: {str(e)}")
@@ -422,7 +550,7 @@ class ParallelEditorUI:
             st.markdown("### ✏️ Editable Text")
             
             # OpenAI Text Improvement Controls
-            col2_1, col2_2 = st.columns([2, 1])
+            col2_1, col2_2, col2_3 = st.columns([2, 1, 1])
             
             with col2_1:
                 improvement_type = st.selectbox(
@@ -441,6 +569,17 @@ class ParallelEditorUI:
                     # Store the improvement request in session state to be processed
                     st.session_state[f"ai_improve_request_{chunk_id}"] = {
                         "improvement_type": improvement_type,
+                        "chunk_id": chunk_id
+                    }
+                    st.rerun()
+            
+            with col2_3:
+                spell_check_clicked = st.button("📝 Spell Check", key=f"spell_check_{chunk_id}", help="Run spell check on the text")
+                
+                # Handle spell check within the UI component
+                if spell_check_clicked:
+                    # Store the spell check request in session state to be processed
+                    st.session_state[f"spell_check_request_{chunk_id}"] = {
                         "chunk_id": chunk_id
                     }
                     st.rerun()
@@ -470,12 +609,40 @@ class ParallelEditorUI:
                 if result["success"]:
                     session_key = f"editing_session_{chunk_id}"
                     st.session_state[session_key] = result["updated_session"]
+                    
+                    # Save text version for history
+                    try:
+                        # Import the save function dynamically to avoid circular imports
+                        import sys
+                        import importlib
+                        
+                        # Try to access save_text_version from the main module's globals
+                        if 'save_text_version' in globals():
+                            save_text_version(chunk_id, edited_text, "edit")
+                        else:
+                            # Alternative approach - save to session state for later processing
+                            if 'text_versions_to_save' not in st.session_state:
+                                st.session_state.text_versions_to_save = []
+                            st.session_state.text_versions_to_save.append({
+                                'chunk_id': chunk_id,
+                                'text': edited_text,
+                                'version_type': 'edit'
+                            })
+                    except:
+                        pass  # Silently ignore version saving errors
             
             # Show change indicator and AI improvement status
             if editing_session.get("last_summary"):
                 summary_info = editing_session["last_summary"]
                 word_count = len(summary_info["summary_text"].split())
                 st.info(f"📋 Summary generated ({word_count} words)")
+            
+            if editing_session.get("last_spell_check"):
+                spell_check_info = editing_session["last_spell_check"]
+                if spell_check_info.get("changes_made", False):
+                    st.success("📝 Spell check applied - corrections made")
+                else:
+                    st.info("📝 Spell check applied - no corrections needed")
             
             if editing_session.get("last_ai_improvement"):
                 improvement_info = editing_session["last_ai_improvement"]
@@ -517,7 +684,7 @@ class ParallelEditorUI:
                     "Summary Length (words)", 
                     min_value=100, 
                     max_value=500, 
-                    value=250, 
+                    value=350, 
                     step=50,
                     key=f"summary_length_{chunk_id}"
                 )
